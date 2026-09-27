@@ -341,3 +341,25 @@ def test_state_machine_blocks_qv_shopping_reevaluation_and_weight_tampering(tmp_
     assert r1["failure_mode"] == "ACCEPTED" and r1["rubric"][0]["weight"] == 5 and abs(r1["weak_avg"] - 0.15) < 1e-9
     # only one QV subagent transcript exists for the round (the repeat was refused before spawning)
     assert len(list((wd / "trajectory").glob("quality_verifier_*.jsonl"))) == 1
+
+
+def test_final_qv_repair_reruns_only_the_end_of_loop_verifier(tmp_path: Path):
+    """An accepted paper whose final QV did not complete (infrastructure failure) is repaired without redoing the loop."""
+    scenario = Scenario()
+    summary, wd = _run(tmp_path, scenario, paper_id="p4")
+    assert summary["final_accepted"] is True
+    broken = json.loads(json.dumps(summary))
+    broken["final_qv"] = {"passed": False, "qv_completed": False, "qv": {"overall": None}, "qv_output": "error: outage", "programmatic": {}}
+    broken["final_accepted"] = False
+    (wd / "harness_summary.json").write_text(json.dumps(broken))
+    n_runs_before = len(list((wd / "eval_attempts").glob("run_*")))
+    n_qv_before = len(list((wd / "trajectory").glob("*qv*.jsonl")))
+    with FakeServer(Scenario()) as srv:
+        cfg = _config(srv.base_url, tmp_path)
+        clients = {r: LLMClient(cfg.endpoint(r), name=r) for r in ("main_agent", "challenger", "quality_verifier")}
+        paper = PaperInput(paper_id="p4", title="A retrieval paper", text="Title: A retrieval paper\n\nAbstract: x\n\n" + "body " * 500)
+        run = PaperRun(cfg, paper, wd, clients, PromptSet(PROMPTS), PROMPTS, log=lambda m: None)
+        update = asyncio.run(run.run_final_qv_only(broken))
+    assert update["final_accepted"] is True and update["final_qv"]["qv_completed"] is True
+    assert len(list((wd / "eval_attempts").glob("run_*"))) == n_runs_before          # no new evaluations
+    assert len(list((wd / "trajectory").glob("*qv*.jsonl"))) == n_qv_before + 1       # exactly one new QV transcript

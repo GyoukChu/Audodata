@@ -512,3 +512,30 @@ def test_hard_context_rejects_nonpositive_model_length(limit):
     client, _ = client_for([text_response("unused")])
     with pytest.raises(ValueError, match="max_model_len"):
         Agent(name="main", system_prompt="s", llm=client, max_steps=1, tools=[], max_model_len=limit)
+
+
+async def test_hard_preflight_reduction_applies_only_to_that_call():
+    response = tool_call_response([("read", {})])
+    response["usage"]["prompt_tokens"] = 9000
+    next_response = tool_call_response([("read", {})])
+    next_response["usage"]["prompt_tokens"] = 100
+    client, responder = client_for([response, next_response, text_response("done")], max_tokens=10000)
+    result = await Agent(name="main", system_prompt="s", llm=client, max_steps=3, max_model_len=18000,
+                         tools=[Tool("read", "read", {}, AsyncMock(return_value="x" * 1000))]).run("u")
+    assert result.stop_reason == "final"
+    assert [request["max_tokens"] for request in responder.requests] == [10000, 8749, 10000]
+    assert client.endpoint.max_tokens == 10000
+
+
+async def test_hard_preflight_also_respects_soft_budget_without_shrinking_recent_window():
+    response = tool_call_response([("read", {})], reasoning="r" * 1000)
+    client, responder = client_for([response, response, text_response("done")], max_tokens=10000)
+    events = []
+    result = await Agent(name="main", system_prompt="s", llm=client, max_steps=3, max_model_len=40000,
+                         context_budget_tokens=1, keep_recent_tool_results=1, event_hook=events.append,
+                         tools=[Tool("read", "read", {}, AsyncMock(return_value="x" * 1000))]).run("u")
+    assert result.stop_reason == "final"
+    actions = [event.data["action"] for event in events if event.kind == "elide"]
+    assert actions == ["elide_tool_result", "drop_reasoning"]
+    assert responder.requests[-1]["messages"][-1]["content"] == "x" * 1000
+    assert all(request["max_tokens"] == 10000 for request in responder.requests)

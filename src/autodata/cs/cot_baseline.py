@@ -115,14 +115,16 @@ async def run_one(cfg: AppConfig, paper: PaperInput, workdir: Path, clients: dic
 
 
 async def run_corpus(cfg: AppConfig, papers: list[PaperInput], root: Path, *, concurrency: int, resume: bool = True,
-                     prompts_dir: Path | None = None) -> list[dict]:
+                     prompts_dir: Path | None = None, allow_config_mismatch: bool = False,
+                     corpus_path: Path | None = None) -> list[dict]:
     def is_done(summary: dict) -> bool:
         return (not summary.get("errors") and summary.get("weak_avg") is not None
                 and summary.get("strong_avg") is not None)
 
     return await run_papers(cfg, papers, root, concurrency=concurrency, resume=resume, retry_errors=True,
                             summary_filename="cot_summary.json", is_done=is_done, run_one=partial(run_one, cfg),
-                            roles=("challenger", "quality_verifier"), prompts_dir=prompts_dir)
+                            roles=("challenger", "quality_verifier"), prompts_dir=prompts_dir,
+                            allow_config_mismatch=allow_config_mismatch, corpus_path=corpus_path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -136,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--concurrency", type=int)
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--prompts-dir")
+    ap.add_argument("--allow-config-mismatch", action="store_true", help="record changed config/prompts in the cohort history instead of refusing to resume")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     ids = set(args.paper_ids.split(",")) if args.paper_ids else None
@@ -147,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     conc = args.concurrency or cfg.run.paper_concurrency
     print(f"CoT baseline: {len(papers)} papers -> {root} (concurrency {conc})", flush=True)
     results = asyncio.run(run_corpus(cfg, papers, root, concurrency=conc, resume=not args.no_resume,
+                                     allow_config_mismatch=args.allow_config_mismatch, corpus_path=Path(args.corpus),
                                      prompts_dir=Path(args.prompts_dir) if args.prompts_dir else None))
     ok = [r for r in results if r.get("weak_avg") is not None and r.get("strong_avg") is not None and not r.get("errors")]
     print(f"done: {len(results)} papers, {len(ok)} fully evaluated", flush=True)

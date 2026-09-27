@@ -340,6 +340,7 @@ class PaperRun:
             llm=self.clients[subagent_type],
             max_steps=self.cfg.run.subagent_max_steps,
             transcript_path=self.workdir / "trajectory" / f"{name}.jsonl",
+            max_model_len=getattr(self.cfg.run, "max_model_len", None),
         )
 
     def _account(self, result: AgentResult) -> None:
@@ -700,6 +701,28 @@ class PaperRun:
         passed = bool(parsed.get("overall")) and completed and programmatic["context_ok"] and programmatic["rubric_ok"]
         return {"passed": passed, "qv": parsed, "qv_completed": completed, "qv_output": text[-6000:], "programmatic": programmatic}
 
+    async def run_final_qv_only(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """Repair path (resume): the paper was accepted but its end-of-loop QV never completed (infrastructure failure).
+        Re-runs ONLY the final QV on the frozen accepted candidate recorded in the summary; returns the fields to merge."""
+        t0 = time.time()
+        idx = summary.get("accepted_round")
+        rounds = summary.get("rounds") or []
+        if not summary.get("accepted") or not idx or idx > len(rounds):
+            raise ValueError("summary has no accepted round to repair")
+        rd = rounds[idx - 1]
+        self.ws = prepare_workspace(self.cfg, self.paper, self.workdir, self.prompts_dir_abs)
+        self.subagent_counter["quality_verifier"] = sum(1 for _ in (self.workdir / "trajectory").glob("*qv*.jsonl")) + 1
+        candidate = {k: rd.get(k) for k in ("question_type", "context", "question", "rubric")}
+        self.accepted_round_idx = idx
+        self.accepted = {"round": idx, "candidate": candidate, "reference_answer": rd.get("reference_answer"),
+                         "verdict": {k: rd.get(k) for k in ("weak_avg", "strong_avg", "gap", "weak_passed", "strong_passed",
+                                                             "gap_passed", "weak_scores", "strong_scores")} | {"all_passed": True}}
+        final_qv = await self.run_final_qv()
+        errors = list(summary.get("errors") or []) + self.errors
+        return {"final_qv": final_qv, "final_accepted": bool(final_qv and final_qv.get("passed")),
+                "final_qv_repaired_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errors,
+                "wall_time_s": round(float(summary.get("wall_time_s") or 0) + time.time() - t0, 1)}
+
     # ------------------------------------------------------------------ summary
     def _round_summary(self, rec: RoundRecord) -> dict[str, Any]:
         strong_ev = rec.last_eval("strong-only") or rec.last_eval("both")
@@ -836,6 +859,7 @@ class PaperRun:
             event_hook=self._on_event,
             context_budget_chars=self.cfg.run.main_agent_context_budget_chars,
             context_budget_tokens=getattr(self.cfg.run, "main_agent_context_budget_tokens", None),
+            max_model_len=getattr(self.cfg.run, "max_model_len", None),
         )
         result: AgentResult | None = None
         try:

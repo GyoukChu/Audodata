@@ -185,11 +185,10 @@ class Agent:
                     **context_data(),
                 })
 
-        def hard_preflight(step: int, *, max_tokens: int | None = None) -> int | None:
+        def hard_preflight(step: int) -> int | None:
             if self.max_model_len is None:
                 return None
-            if max_tokens is None:
-                max_tokens = self.llm.endpoint.max_tokens
+            max_tokens = self.llm.endpoint.max_tokens
 
             def estimate() -> float:
                 total = sum(_message_chars(message) for message in messages)
@@ -200,15 +199,22 @@ class Agent:
             def fits() -> bool:
                 return estimate() + max_tokens <= self.max_model_len
 
+            def fits_soft_budget() -> bool:
+                if self.context_budget_tokens is not None:
+                    return estimate() <= self.context_budget_tokens
+                if self.context_budget_chars is not None:
+                    return sum(_message_chars(message) for message in messages) <= self.context_budget_chars
+                return True
+
             def log(action: str, **data) -> None:
                 self._event(step, "elide", {
                     "action": action, "context_tokens": estimate(),
                     "max_tokens": max_tokens, "max_model_len": self.max_model_len, **data,
                 })
 
-            def compact(indexes: list[int], *, reasoning: bool = False) -> None:
+            def compact(indexes: list[int], *, reasoning: bool = False, soft_budget: bool = False) -> None:
                 for index in indexes:
-                    if fits():
+                    if fits() and (not soft_budget or fits_soft_budget()):
                         break
                     message = messages[index]
                     before = _message_chars(message)
@@ -233,8 +239,8 @@ class Agent:
             tools = [i for i, message in enumerate(messages) if message["role"] == "tool"]
             turns = [i for i, message in enumerate(messages) if message["role"] == "assistant"]
             keep = self.keep_recent_tool_results
-            compact(tools[:max(0, len(tools) - keep)])
-            compact(turns[:max(0, len(turns) - keep)], reasoning=True)
+            compact(tools[:max(0, len(tools) - keep)], soft_budget=True)
+            compact(turns[:max(0, len(turns) - keep)], reasoning=True, soft_budget=True)
             protected = tools[max(0, len(tools) - keep):] + turns[max(0, len(turns) - keep):]
             window = max(2, len(messages) - min(protected, default=len(messages)))
             while not fits() and window > 2:
@@ -262,9 +268,9 @@ class Agent:
             append({"role": "user", "content": task_prompt}, 0)
             for step in range(1, self.max_steps + 1):
                 steps_used = step
+                if self.max_model_len is None:
+                    fit_context(step)
                 call_max_tokens = hard_preflight(step)
-                fit_context(step)
-                call_max_tokens = hard_preflight(step, max_tokens=call_max_tokens)
                 usage["calls"] += 1
                 sent_chars = sum(_message_chars(message) for message in messages)
                 completion = await self.llm.chat(

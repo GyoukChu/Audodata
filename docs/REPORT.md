@@ -42,6 +42,16 @@ at 8-32 concurrent; solvers slow to 40-50% while GLM is busy. GPUs 0-1 keep only
   reasoning-aware context budget (+ token budget 290k), formatted-verdict parsing, last-valid-JSON extraction,
   validated acceptance overrides, flock locks, archive-on-rerun, archive-aware stats, strong-only gated on a passing weak
   run, shared retry/request helpers, CoT/pipeline dedupe (Codex F2/F3).
+- Round 3 (final Codex gpt-6-astra review, 15 findings; decisions in docs/knowledge-base/review-decisions.md): two
+  P0s confirmed and fixed — the public checkout was missing `src/autodata/data/` (unanchored ignore rule) and all solver
+  attempts carried the same seed (two attempts with identical responses observed), so the 3 attempts were not independent;
+  the 22 accepted smoke-run items were evaluated before the seed change and are unaffected, the pilot evaluations made
+  under the shared seed were discarded and the pilot restarted at 13:44. Also fixed: the CoT baseline now evaluates the
+  strong solver unconditionally (`--force-strong`, unavailable to the agent), QV binding includes each criterion's weight
+  and |weight| is bounded to 1..10, repeated QV / repeated evaluation / non-challenger questions / evaluation after
+  acceptance are refused, the accepted round reports its frozen verdict, the evaluator dies with its parent, and a NOTICE
+  file credits the third-party prompt text. Delegated: hard context preflight, final-QV repair on resume, endpoint health
+  gate, cohort manifest + cohort-level statistics, config/prompt fingerprint enforcement.
 - GLM-5.3 thinking settings verified on the live server: interleaved thinking on (within-turn reasoning rendered back
   before each tool call), preserved thinking off (`clear_thinking: true` clears earlier user turns' thinking).
 - Real-server probes: challenger JSON (14-15 criteria), QV 7-line verdict, judge JSON, evaluator reports.

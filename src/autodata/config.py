@@ -106,6 +106,7 @@ class RunConfig(BaseModel):
     max_rounds: int = 15                 # per-paper challenger rounds (ruled: 15)
     main_agent_max_steps: int = 120      # LLM turns for the orchestrator
     main_agent_context_budget_chars: int = 1_000_000  # ~285k tokens; older tool results are elided beyond this (OpenCode-style compaction)
+    max_model_len: int = 400_000        # served GLM context (vLLM --max-model-len); hard preflight: prompt + max_tokens must fit
     main_agent_context_budget_tokens: int | None = 290_000  # measured prompt tokens (vLLM usage) + 81,920 output must stay < 400k max-model-len
     subagent_max_steps: int = 12
     paper_concurrency: int = 8
