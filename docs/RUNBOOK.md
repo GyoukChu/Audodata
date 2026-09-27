@@ -102,6 +102,21 @@ Upgrading code under a running pipeline: the evaluator runs as a fresh subproces
 while runner processes keep the code they started with. Any change to the evaluator report format must stay readable by
 the running harness (e.g. `question_hash` keeps the legacy identity; the canonical identity is `question_hash_canonical`).
 
+## Container restart
+
+The repository (code, `.venv`, `runs/`, `data/`, `logs/`, `env.local.sh`) and the model/compile caches under
+`$AUTODATA_CACHE_DIR` live on shared storage and survive a container restart; the home directory (CLIs, Claude Code and
+Codex settings, `~/.env`) and `/tmp` do not, so keep a private copy of them outside the repository.
+
+1. Optional, 1-2 h before a planned restart: `touch runs/pilot/DRAIN runs/pilot_cot/DRAIN`. In-flight papers finish and
+   no new paper starts; without it, interrupted papers are simply rerun after the restart.
+2. After the restart, restore the home-directory state, then run
+   `setsid nohup bash scripts/resume_pilot.sh > logs/resume_pilot.log 2>&1 < /dev/null &`. It starts the GPU guard, the
+   three servers in sequence, removes the DRAIN files and relaunches the agentic (8 slots) and CoT (2 slots) runners
+   with `--allow-config-mismatch`; statistics are written to `runs/pilot_stats.json` when both finish.
+3. Resume semantics: completed papers are skipped, accepted papers whose final QV never completed are repaired on the
+   frozen candidate, interrupted papers are moved to `<root>/_archive/` and rerun from scratch.
+
 The Semantic Scholar limiter enforces a 3.0-second minimum between requests across all endpoints, including shard
 downloads; lower finite `S2_MIN_INTERVAL` values are clamped to that floor, and negative/non-finite values are rejected.
 The shared file gate honours backoff deadlines through 900 seconds, rechecking them in increments of at most 30 seconds.
