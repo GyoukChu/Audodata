@@ -1,0 +1,63 @@
+# Reference config for the CS research-paper pipeline (Sec 3.1 / App C.1). All numbers are documented in
+# docs/IMPLEMENTATION_SPEC.md and the interview knowledge base.
+run:
+  name: cs_default
+  max_rounds: 15                # ruled 2026-09-27 (paper: mean 6.59, long tail > 10; legal cap 15)
+  main_agent_max_steps: 120
+  main_agent_context_budget_tokens: 290000   # prompt tokens (from vLLM usage) so that prompt + 81,920 output < 400k max-model-len
+  main_agent_context_budget_chars: 1000000   # elide oldest tool results beyond ~285k tokens (GLM max-model-len 400k)
+  subagent_max_steps: 12
+  paper_concurrency: 6
+  workdir_root: runs/cs_default
+  paper_text_max_chars: 200000
+  paper_text_min_chars: 8000
+  final_qv: true                # end-of-loop quality verifier (Sec 3.1)
+  seed: 0
+acceptance_preset: prose_s31    # strong_avg >= 0.65, weak_avg < 0.50, gap >= 0.20 (Sec 3.1 prose); alt: deployed_c1
+eval:
+  n_attempts: 3                 # "each invoked 3 times to reduce variance"
+  timeout_s: 600                # verbatim --timeout 600
+  judge_retries: 3
+  solver_retries: 3
+prompts_dir: prompts/cs
+endpoints:
+  glm53:
+    base_url: http://127.0.0.1:8000/v1
+    model: glm-5.3
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 81920           # user 2026-09-27: GLM-5.3 max generation length 81,920 (max effort kept); solvers stay at 32,768
+    chat_template_kwargs: {reasoning_effort: max, clear_thinking: true}   # max effort; interleaved thinking ON (reasoning passed back within the turn), preserved thinking OFF (earlier turns' thinking cleared)
+    timeout_s: 7200
+    max_concurrency: 48
+  qwen27b:
+    base_url: http://127.0.0.1:8001/v1
+    model: qwen3.8-27b
+    temperature: 1.0            # paper: solvers at temperature 1.0 (Sec 4); rest = Qwen thinking-mode defaults
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    presence_penalty: 0.0
+    max_tokens: 32768           # ruled 2026-09-27
+    chat_template_kwargs: {enable_thinking: true}
+    timeout_s: 3600
+    max_concurrency: 24
+  qwen4b:
+    base_url: http://127.0.0.1:8002/v1
+    model: qwen3.5-4b
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    presence_penalty: 1.5       # Qwen3.5-4B model-card recommendation for thinking mode
+    max_tokens: 32768
+    chat_template_kwargs: {enable_thinking: true}
+    timeout_s: 3600
+    max_concurrency: 48
+roles:
+  main_agent: glm53
+  challenger: glm53
+  quality_verifier: glm53
+  judge: {use: glm53, timeout_s: 3600}
+  weak_solver: qwen4b
+  strong_solver: qwen27b

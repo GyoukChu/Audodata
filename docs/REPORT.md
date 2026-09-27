@@ -1,0 +1,72 @@
+# Reproduction report — Agentic Self-Instruct (Autodata, arXiv 2606.25996v3), CS pipeline
+
+_Status: draft written during the first real runs (2026-09-27). Numbers in §6 are refreshed by `autodata-stats`._
+
+## 1. What was reproduced
+The Sec. 3.1 / App. C.1 pipeline: an LLM main agent (verbatim RAM-README prompt) orchestrating a challenger and a quality
+verifier (prompts expanded verbatim from Fig. 8/9), an `evaluate_rubric.py` tool that runs the weak solver x3 and the strong
+solver x3 and grades every answer per criterion with an LLM judge, the acceptance predicate of Sec. 3.1 (strong_avg >= 0.65,
+weak_avg < 0.50, gap >= 20 pp), grouped TOO EASY / FAILED ON STRONG / FAILED QUALITY CHECK feedback, "ENTIRELY NEW question
+from a DIFFERENT angle" refinement, the end-of-loop quality verifier, and the CoT Self-Instruct baseline (single shot +
+same QV + 3+3 solver attempts). Table-1 statistics are produced by `autodata-stats`.
+
+## 2. Substitutions (user rulings) and their consequences
+| Paper | Here | Consequence observed |
+|---|---|---|
+| Kimi-K2.6 (orchestrator, challenger, QV, judge) | GLM-5.3 (nvidia/GLM-5.3-NVFP4, reasoning_effort=max, max_tokens 81,920) | challenger calls generate 40-65k reasoning tokens (~9 min single-stream); judge calls 2-30k tokens |
+| Qwen3.5-397B-A17B strong solver | Qwen3.8-27B-FP8 (thinking, 32,768 max tokens) | often fails hard questions or exhausts the 32k budget while thinking -> FAILED ON STRONG dominates round rejections (paper: TOO EASY dominated, 80%) |
+| Qwen3.5-4B weak solver | same (thinking, 32,768) | scores 0-0.4 on round-1 questions |
+| S2ORC CS 2022+ | s2orc_v2 shard 0, CS label from S2, 2022+ | 38% of "CS" papers are CS only by the S2 classifier (medical/physics ML included) |
+
+## 3. Fidelity decisions (see the interview knowledge base, ambiguities.md)
+- Acceptance thresholds: Sec. 3.1 prose (default) — the appendix/README "deployed" form is a config preset.
+- 15 rounds per paper (paper: unspecified; mean 6.59, legal cap 15). Solvers: temperature 1.0, thinking on, 32k tokens.
+- Rubric score = clip((earned − penalty) / max_positive, 0, 1), binary per-criterion judgments, judge never sees the
+  reference answer, solvers see context + question only.
+- Truncated solver responses (finish_reason=length, no final answer) are graded as-is (score 0), not retried.
+- Judge: reasoning_effort max (user ruling); on a verdict-less truncation the retry steps the effort down (error path only).
+- Guardrails (paper §6 "agents trying to cheat"): isolated evaluator subprocess, write allow-list, provenance-verified
+  reports, harness-recomputed verdicts, QV bound to the evaluated question, frozen accepted candidate, round budget.
+
+## 4. Serving (4x B200)
+GLM-5.3-NVFP4 TP4+EP, fp8 KV, MTP(1) — 491k-token KV; Qwen3.8-27B-FP8 TP2 (GPU0-1) + MTP(2); Qwen3.5-4B DP2 (GPU2-3) + MTP(2).
+No weight offload; KV offload impossible (/dev/shm 200 GB). Measured: GLM ~110 tok/s single stream, ~450-500 tok/s aggregate
+at 8-32 concurrent; solvers slow to 40-50% while GLM is busy. GPUs 0-1 keep only ~3.4 GB free (watch for OOM).
+
+## 5. Verification
+- 484 offline tests (fake OpenAI server; e2e loop, guardrails, evaluator, corpus builder, pipeline driver, CoT baseline, stats).
+- Review rounds: (1) Codex gpt-6-astra xhigh read-only review -> P0/P1 fixes (isolated evaluator, write allow-list,
+  provenance-verified reports, QV binding, resume/lock/deadline fixes); (2) code-review skill (max effort; some angles hit
+  the session rate limit) -> canonical-path allow-list, subagent paper-only view, models/prompts/config provenance,
+  strict QV binding (question + context head + every criterion), timeout clamp, truncation-aware client retries,
+  reasoning-aware context budget (+ token budget 290k), formatted-verdict parsing, last-valid-JSON extraction,
+  validated acceptance overrides, flock locks, archive-on-rerun, archive-aware stats, strong-only gated on a passing weak
+  run, shared retry/request helpers, CoT/pipeline dedupe (Codex F2/F3).
+- GLM-5.3 thinking settings verified on the live server: interleaved thinking on (within-turn reasoning rendered back
+  before each tool call), preserved thinking off (`clear_thinking: true` clears earlier user turns' thinking).
+- Real-server probes: challenger JSON (14-15 criteria), QV 7-line verdict, judge JSON, evaluator reports.
+- First accepted items verified end to end: harness verdict == agent's result.json claim; final QV passed.
+
+## 6. Results (smoke, 24 papers) — see runs/smoke24_stats.json
+Interim snapshot at 11:05 (14 of 24 papers finished; refreshed at the end by `autodata-stats`):
+
+| Metric (Table 1 analogue) | Paper: CoT | Paper: Agentic | Ours: CoT (n=21) | Ours: Agentic accepted (n=14) |
+|---|---|---|---|---|
+| Weak solver avg | 0.677 | 0.458 | 0.223 | 0.266 |
+| Strong solver avg | 0.696 | 0.772 | 0.490 | 0.840 |
+| Gap (strong − weak) | 0.019 | 0.314 | 0.268 | 0.574 |
+| Agentic rounds (mean / median / max) | 1 | 6.59 | 1 | 2.71 / 3 / 4 |
+| Question length (chars) | 723 | 619 | 652 | 1068 |
+| Rubric items | 13.2 | 13.1 | 14.5 | 14.6 |
+
+Failed-round modes so far: FAILED ON STRONG 54%, TOO EASY 29%, FAILED QV 17% (paper: 80% too easy, 13% strong failed).
+Reading: with a 27B strong solver, single-shot GLM questions are already hard for the 4B (weak 0.22) and the loop's main
+effect is to find questions the strong solver can actually answer (strong 0.49 -> 0.84) while keeping the weak solver low,
+i.e. the same "discriminative" objective as the paper reached from the opposite starting point (paper: CoT questions too
+easy). Acceptance rate so far 100% within <= 4 rounds; 12 of 14 accepted items also pass the end-of-loop QV.
+
+## 7. Known limitations / next steps
+- Throughput: ~40 min per paper at 8-way concurrency (dominated by GLM reasoning at max effort); a 320-paper pilot needs
+  ~1-2 days on this box. Resumable (`autodata-run-cs ... --workdir-root runs/pilot`).
+- The strong solver is far weaker than the paper's; expect a lower acceptance rate and a different failure-mode mix.
+- Legal (App. C.2), scientific (App. C.3), meta-optimization (Sec. 4) and RL are not implemented yet.

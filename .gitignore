@@ -1,0 +1,20 @@
+# environments / secrets / machine-specific
+.venv/
+.env
+env.local.sh
+.cache/
+# run artefacts and data (regenerate with the runbook)
+runs/
+data/
+logs/
+*.log
+_archive/
+_locks/
+serving/bench/results/
+serving/OPTIMIZATION_DONE
+serving/RESTART_ALLOWED
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/

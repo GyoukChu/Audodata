@@ -1,0 +1,71 @@
+# Pilot/smoke config = cs_default.yaml (paper-faithful: GLM-5.3 at reasoning_effort max, max_tokens 81,920 for all GLM
+# roles; solvers thinking on, max_tokens 32,768) with paper_concurrency 8 (GLM KV cache of 649k tokens fits ~8 long streams).
+# Note: the judge's truncation fallback (eval.judge_effort_fallback) lowers the effort ONLY for a retry after a verdict-less
+# 81,920-token truncation; it is an error-handling path, not a setting change.
+run:
+  name: cs_pilot
+  max_rounds: 15
+  main_agent_max_steps: 120
+  main_agent_context_budget_tokens: 290000   # prompt tokens (from vLLM usage) so that prompt + 81,920 output < 400k max-model-len
+  main_agent_context_budget_chars: 1000000
+  subagent_max_steps: 12
+  paper_concurrency: 8
+  workdir_root: runs/cs_pilot
+  paper_text_max_chars: 200000
+  paper_text_min_chars: 8000
+  final_qv: true
+  seed: 0
+acceptance_preset: prose_s31
+eval:
+  n_attempts: 3
+  timeout_s: 600
+  judge_retries: 3
+  solver_retries: 3
+prompts_dir: prompts/cs
+endpoints:
+  glm53:
+    base_url: http://127.0.0.1:8000/v1
+    model: glm-5.3
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 81920
+    chat_template_kwargs:
+      reasoning_effort: max
+      clear_thinking: true   # interleaved thinking on (within-turn reasoning kept), preserved thinking off (previous turns cleared)
+    timeout_s: 7200
+    max_concurrency: 48
+  qwen27b:
+    base_url: http://127.0.0.1:8001/v1
+    model: qwen3.8-27b
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    presence_penalty: 0.0
+    max_tokens: 32768
+    chat_template_kwargs:
+      enable_thinking: true
+    timeout_s: 3600
+    max_concurrency: 24
+  qwen4b:
+    base_url: http://127.0.0.1:8002/v1
+    model: qwen3.5-4b
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    presence_penalty: 1.5
+    max_tokens: 32768
+    chat_template_kwargs:
+      enable_thinking: true
+    timeout_s: 3600
+    max_concurrency: 48
+roles:
+  main_agent: glm53
+  challenger: glm53
+  quality_verifier: glm53
+  judge:
+    use: glm53
+    timeout_s: 3600
+  weak_solver: qwen4b
+  strong_solver: qwen27b
