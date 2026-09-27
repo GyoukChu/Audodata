@@ -539,3 +539,21 @@ async def test_hard_preflight_also_respects_soft_budget_without_shrinking_recent
     assert actions == ["elide_tool_result", "drop_reasoning"]
     assert responder.requests[-1]["messages"][-1]["content"] == "x" * 1000
     assert all(request["max_tokens"] == 10000 for request in responder.requests)
+
+
+async def test_hard_preflight_uses_last_successful_prompt_after_billed_retry(tmp_path, monkeypatch):
+    from tests.fake_openai_server import FakeServer
+    monkeypatch.setattr(LLMClient, '_backoff', staticmethod(lambda _: 0))
+    tool_response = tool_call_response([('read', {'filePath': 'paper.txt'})])
+    tool_response['usage'] = {'prompt_tokens': 7000, 'completion_tokens': 5, 'total_tokens': 7005}
+    responder = ScriptedResponder([text_response('', prompt_tokens=7000), tool_response,
+                                   text_response('done', prompt_tokens=7000)])
+    (tmp_path / 'paper.txt').write_text('Short result.')
+    with FakeServer(responder) as server:
+        client = LLMClient(ModelEndpoint(base_url=server.base_url, model='fake', max_tokens=512, max_retries=1))
+        agent = Agent(name='main', system_prompt='Read the paper.', tools=[make_read_tool(Workspace(tmp_path))],
+                      llm=client, max_steps=2, max_model_len=10000)
+        result = await agent.run('Read paper.txt and finish.')
+    assert result.stop_reason == 'final' and result.final_text == 'done'
+    assert len(responder.requests) == 3
+    assert result.usage['prompt_tokens'] == client.usage_totals['prompt_tokens'] == 21000

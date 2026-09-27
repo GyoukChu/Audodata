@@ -3,7 +3,7 @@
 HARD RULE (docs/IMPLEMENTATION_SPEC.md §2.5; the API key is a shared lab key): every request made by this module --
 API calls *and* S3 shard downloads -- goes through ONE process-wide :class:`RateLimiter`:
 
-* at least ``S2_MIN_INTERVAL`` seconds (default 3.0, never below 1.0) between the END of one request and the START
+* at least ``S2_MIN_INTERVAL`` seconds (default 3.0, never below 3.0) between the END of one request and the START
   of the next (stricter than start-to-start spacing; 429s were observed at 1.3 s spacing, 3 s with backoff worked);
 * never two requests in flight: the limiter slot is held for the whole request, including a streamed download;
 * exponential backoff on 429 / 5xx / transport errors: 5, 10, 20, 40, 80, 160 s (+ up to 20 % jitter, or
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import math
 import os
 import random
 import re
@@ -37,11 +38,12 @@ PAPER_BATCH_PATH = "/graph/v1/paper/batch"
 PAPER_BATCH_FIELDS = "corpusId,title,abstract,year,publicationDate,s2FieldsOfStudy,externalIds,venue,citationCount"
 MAX_BATCH_IDS = 500                      # /paper/batch hard limit
 DEFAULT_MIN_INTERVAL = 3.0               # seconds between any two requests (S2_MIN_INTERVAL)
-MIN_INTERVAL_FLOOR = 1.0                 # nominal key limit is 1 request/s cumulative -- never go below
+MIN_INTERVAL_FLOOR = 3.0                 # required spacing for the shared key across all endpoints
 BACKOFF_SCHEDULE: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0, 80.0, 160.0)
 MAX_TRIES = 8
 JITTER_FRACTION = 0.2
-MAX_FILE_GATE_WAIT = 600.0               # ignore a (stale/bogus) inter-process deadline further away than this
+MAX_BACKOFF = 900.0
+FILE_GATE_POLL_S = 30.0                 # bounded waits recheck the shared deadline
 
 
 def log(msg: str) -> None:
@@ -81,9 +83,10 @@ class RateLimiter:
     def __init__(self, min_interval: float = DEFAULT_MIN_INTERVAL, *, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, lock_path: str | os.PathLike[str] | None = None,
                  wall_clock: Callable[[], float] = time.time) -> None:
-        if min_interval < 0:
-            raise ValueError("min_interval must be >= 0")
-        self.min_interval = float(min_interval)
+        min_interval = float(min_interval)
+        if not math.isfinite(min_interval) or min_interval < 0:
+            raise ValueError("min_interval must be finite and nonnegative")
+        self.min_interval = max(MIN_INTERVAL_FLOOR, min_interval)
         self._clock, self._sleep, self._wall = clock, sleep, wall_clock
         self._lock = threading.Lock()
         self._next_allowed: float | None = None   # in `clock` time
@@ -120,10 +123,11 @@ class RateLimiter:
                 deadline = self._read_file_deadline(fd)
                 if deadline is not None:
                     file_wait = deadline - self._wall()
-                    if file_wait <= MAX_FILE_GATE_WAIT:
+                    if math.isfinite(file_wait) and file_wait <= max(MAX_BACKOFF, self.min_interval) + 0.001:
                         wait = max(wait, file_wait)
             if wait <= 0:
                 return
+            wait = min(wait, FILE_GATE_POLL_S)
             self.total_wait_s += wait
             self._sleep(wait)
 
@@ -174,6 +178,8 @@ def min_interval_from_env() -> float:
             value = float(raw)
         except ValueError:
             log(f"warning: S2_MIN_INTERVAL={raw!r} is not a number; using {DEFAULT_MIN_INTERVAL}")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("S2_MIN_INTERVAL must be finite and nonnegative")
     if value < MIN_INTERVAL_FLOOR:
         log(f"warning: S2_MIN_INTERVAL={value} is below the {MIN_INTERVAL_FLOOR} s floor; using {MIN_INTERVAL_FLOOR}")
         value = MIN_INTERVAL_FLOOR
@@ -278,7 +284,7 @@ class S2Client:
         if response is not None:
             retry_after = response.headers.get("retry-after", "").strip()
             if retry_after.replace(".", "", 1).isdigit():
-                delay = max(delay, min(float(retry_after), 900.0))
+                delay = max(delay, min(float(retry_after), MAX_BACKOFF))
         return delay
 
     @staticmethod

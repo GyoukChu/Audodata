@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -15,7 +16,7 @@ import pytest
 
 from autodata.config import AcceptancePreset, ModelEndpoint, PRESETS
 from autodata.cs import solvers
-from autodata.cs.evaluate_rubric import _assess, assess_attempts, compute_question_hash, main
+from autodata.cs.evaluate_rubric import _assess, assess_attempts, compute_question_hash, legacy_question_hash, main
 from autodata.cs.rubric import parse_rubric, score_response
 from autodata.cs.solvers import PROMPTS_DIR, SyncClient, build_solver_messages, run_solver
 from tests.fake_openai_server import FakeServer, ScriptedResponder, make_transport, text_response
@@ -99,8 +100,8 @@ def test_both_modes_complete_artifacts_and_no_answer_leakage(tmp_path, capsys):
     assert "SECRET_REFERENCE_NEVER_SENT" not in json.dumps(calls)
     assert "private-key" not in path.read_text()
     assert report["started_at"] <= report["completed_at"] and report["latency_s"] >= 0
-    expected_hash = hashlib.sha1(json.dumps({k: DATA[k] for k in ("context", "question", "rubric")}).encode()).hexdigest()
-    assert report["question_hash"] == expected_hash
+    assert report["question_hash"] == legacy_question_hash(DATA)
+    assert report["question_hash_canonical"] == compute_question_hash(DATA)
     for name in ("input", "config"):
         source = Path(argv[argv.index(f"--{name}") + 1]).resolve()
         assert report[f"{name}_path"] == str(source)
@@ -326,7 +327,7 @@ def test_compute_question_hash_is_stable_and_ignores_extra_fields():
     before = deepcopy(DATA)
     reordered = {"reference_answer": "changed", "rubric": deepcopy(RUBRIC),
                  "question": DATA["question"], "context": DATA["context"]}
-    expected = hashlib.sha1(json.dumps({key: DATA[key] for key in ("context", "question", "rubric")}).encode()).hexdigest()
+    expected = compute_question_hash(DATA)
     assert compute_question_hash(DATA) == compute_question_hash(reordered) == expected
     assert DATA == before
     for key, value in (("context", "different"), ("question", "different"), ("rubric", RUBRIC[:-1])):
@@ -728,3 +729,84 @@ def test_three_attempts_get_distinct_seeds_when_seeded(tmp_path):
     assert attempt_seed(7, data, "weak", 1) == attempt_seed(7, data, "weak", 1)  # reproducible
     assert attempt_seed(7, data, "strong", 1) != attempt_seed(7, data, "weak", 1)
     assert attempt_seed(None, data, "weak", 1) is None
+
+
+@pytest.mark.parametrize('force', [False, True])
+def test_force_strong_runs_after_failing_weak(tmp_path, capsys, force):
+    argv, _, output = setup_cli(tmp_path, n_attempts=1)
+    calls = []
+
+    def easy(body, index):
+        calls.append(body['model'])
+        if body['model'] == 'judge':
+            return judgment('strong')  # weak_avg = 0.8, so weak-first gating fails
+        return responder(body, index)
+
+    transport = make_transport(easy)
+    assert main(argv + ['--weak-only'], transport=transport) == 0
+    weak, _ = read_report(capsys.readouterr().out)
+    assert weak['weak_avg'] == 0.8 and weak['weak_passed'] is False
+    calls.clear()
+    assert main(argv + ['--strong-only'] + (['--force-strong'] if force else []), transport=transport) == 0
+    strong, _ = read_report(capsys.readouterr().out)
+    assert bool(strong['strong_attempts']) is force
+    assert ('strong' in calls) is force
+    assert strong['all_passed'] is False
+    calls.clear()
+    assert main(argv, transport=transport) == 0
+    both, _ = read_report(capsys.readouterr().out)
+    assert both['weak_avg'] == 0.8 and not both['strong_attempts']
+    assert 'strong' not in calls
+
+
+def test_canonical_hash_normalises_strings_and_rubric_metadata():
+    original = {'context': 'Café\nnext', 'question': 'Why?\nThen?',
+                'rubric': [{'criterion': 'A café\ncriterion', 'weight': 8, 'category': 'positive'}]}
+    variant = {'question': 'Why?  \r\nThen?\t', 'context': 'Cafe\u0301 \r\nnext\t', 'extra': 'ignored',
+               'rubric': [{'ignored': 1, 'weight': '+8', 'criterion': 'A cafe\u0301\t\r\ncriterion  '}]}
+    canonical = json.dumps(original, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    assert compute_question_hash(original) == compute_question_hash(variant) == hashlib.sha1(canonical.encode()).hexdigest()
+    legacy = json.dumps({key: variant[key] for key in ('context', 'question', 'rubric')})
+    assert legacy_question_hash(variant) == hashlib.sha1(legacy.encode()).hexdigest()
+    assert legacy_question_hash(variant) != compute_question_hash(variant)
+
+
+def test_strong_stage_reuses_legacy_weak_report(tmp_path, capsys):
+    argv, _, _ = setup_cli(tmp_path, n_attempts=1)
+    assert main(argv + ['--weak-only'], transport=make_transport(responder)) == 0
+    weak, path = read_report(capsys.readouterr().out)
+    weak['question_hash'] = legacy_question_hash(DATA)
+    weak.pop('question_hash_canonical', None)  # Reports from before canonical hashing have only the legacy field.
+    path.write_text(json.dumps(weak))
+    assert main(argv + ['--strong-only'], transport=make_transport(responder)) == 0
+    strong, _ = read_report(capsys.readouterr().out)
+    assert strong['weak_source_report'] == str(path)
+    assert strong['all_passed'] is True
+    assert strong['question_hash'] == legacy_question_hash(DATA)
+    assert strong['question_hash_canonical'] == compute_question_hash(DATA)
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux parent-death signal')
+@pytest.mark.parametrize('invocation', [
+    ['-m', 'autodata.cs.evaluate_rubric', '--help'],
+    ['-c', 'import autodata.cs.evaluate_rubric'],
+])
+def test_evaluator_exits_at_import_on_parent_pid_mismatch(tmp_path, invocation):
+    env = {**os.environ, 'AUTODATA_PARENT_PID': '0'}
+    result = subprocess.run([sys.executable, '-I', *invocation], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 5
+    assert 'parent pid mismatch' in result.stderr
+    assert result.stdout == ''
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='Linux prctl')
+def test_parent_death_signal_checks_prctl_result(monkeypatch, capsys):
+    import ctypes
+    from types import SimpleNamespace
+    from autodata.cs.evaluate_rubric import _die_with_parent
+    monkeypatch.setattr(ctypes, 'CDLL', lambda *a, **kw: SimpleNamespace(prctl=lambda *a: -1))
+    with pytest.raises(SystemExit) as exc:
+        _die_with_parent()
+    assert exc.value.code == 5 and 'PR_SET_PDEATHSIG failed' in capsys.readouterr().err

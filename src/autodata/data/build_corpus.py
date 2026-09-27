@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import random
 import re
 import sys
+import tempfile
 import time
 import zlib
 from collections import Counter
@@ -563,7 +565,8 @@ class _ShardStats:
 
 class _Build:
     def __init__(self, *, client: S2Client, out_path: Path, n_papers: int, filt: FilterConfig, shard_cache: Path,
-                 dataset: str, release: str, batch_size: int, meta_cache_path: Path | None) -> None:
+                 dataset: str, release: str, batch_size: int, meta_cache_path: Path | None,
+                 allow_filter_mismatch: bool = False) -> None:
         if n_papers <= 0:
             raise ValueError("--n-papers must be positive")
         if not 1 <= batch_size <= MAX_BATCH_IDS:
@@ -578,6 +581,62 @@ class _Build:
         self.n_total = 0
         self.release_id = ""
         self.listing: DatasetListing | None = None
+        self.allow_filter_mismatch = allow_filter_mismatch
+
+    def validate_resume(self, chosen: list[int]) -> None:
+        """Validate every retained record and the build recipe before counting existing ids."""
+        params = {"dataset": self.dataset, "release_id": self.release_id, "shard_indices": chosen,
+                  "filters": asdict(self.filt), "n_papers": self.n_papers, "batch_size": self.batch_size}
+        meta_path = self.out_path.with_name(self.out_path.name + ".meta.json")
+        previous = None
+        mismatches = []
+        if self.out_path.exists() and meta_path.exists():
+            previous = json.loads(meta_path.read_text(encoding="utf-8"))
+            for key in ("dataset", "release_id", "shard_indices", "filters"):
+                if previous.get(key) != params[key]:
+                    mismatches.append(f"build parameter {key}: {previous.get(key)!r} -> {params[key]!r}")
+        invalid = Counter()
+        examples = []
+        if self.out_path.exists():
+            for record in iter_corpus(self.out_path):
+                reasons = []
+                metadata = {"year": record.get("year"), "abstract": record.get("abstract"),
+                            "s2FieldsOfStudy": [{"category": cat} for cat in record.get("s2_fields") or []]}
+                reason = metadata_outcome(metadata, self.filt)
+                if reason:
+                    reasons.append(reason)
+                body = record.get("body_text")
+                reason = body_outcome(len(body) if isinstance(body, str) else 0, self.filt)
+                if reason:
+                    reasons.append(reason)
+                if record.get("release_id") != self.release_id:
+                    reasons.append("release_id")
+                if record.get("shard") not in chosen:
+                    reasons.append("shard")
+                invalid.update(reasons)
+                if reasons and len(examples) < 5:
+                    examples.append(f"{record.get('paper_id', record.get('corpus_id'))}: {', '.join(reasons)}")
+        if invalid:
+            mismatches.append(f"existing records violate active filters {dict(invalid)}; " + "; ".join(examples))
+        if mismatches:
+            message = f"Filter mismatch in {self.out_path}: " + "; ".join(mismatches)
+            if not self.allow_filter_mismatch:
+                raise ValueError(message + ". Use --allow-filter-mismatch to keep existing records.")
+            log(f"WARNING: {message}; --allow-filter-mismatch keeps existing records")
+        if previous:
+            history = list(previous.get("history", []))
+            if mismatches:
+                history.append({key: value for key, value in previous.items() if key != "history"})
+            if history:
+                params["history"] = history
+        fd, temporary = tempfile.mkstemp(prefix=f".{meta_path.name}.", dir=meta_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(params, stream, indent=2, ensure_ascii=False)
+                stream.write("\n")
+            os.replace(temporary, meta_path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
 
     def save_listing(self, listing: DatasetListing) -> None:
         """Keep the release README + file names (never the presigned URLs) next to the cached shards."""
@@ -722,6 +781,7 @@ class _Build:
             f"target {self.n_papers} papers -> {self.out_path}")
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         existing = load_existing_ids(self.out_path)
+        self.validate_resume(chosen)
         self.existing_ids = set(existing)
         self.claimed = set(existing)
         self.n_total = len(self.existing_ids)
@@ -783,11 +843,12 @@ def build_corpus(*, out_path: str | Path, n_papers: int, client: S2Client, filt:
                  shard_indices: Sequence[int] | None = None, shard_seed: int | None = None,
                  n_shards: int | None = None, shard_cache: str | Path = DEFAULT_SHARD_CACHE,
                  dataset: str = DEFAULT_DATASET, release: str = "latest", batch_size: int = MAX_BATCH_IDS,
-                 meta_cache_path: str | Path | None = None) -> dict[str, Any]:
+                 meta_cache_path: str | Path | None = None, allow_filter_mismatch: bool = False) -> dict[str, Any]:
     """Build (or resume) a corpus JSONL; returns the stats dict (also written to ``<out>.stats.json``)."""
     b = _Build(client=client, out_path=Path(out_path), n_papers=n_papers, filt=filt or FilterConfig(),
                shard_cache=Path(shard_cache), dataset=dataset, release=release, batch_size=batch_size,
-               meta_cache_path=Path(meta_cache_path) if meta_cache_path else None)
+               meta_cache_path=Path(meta_cache_path) if meta_cache_path else None,
+               allow_filter_mismatch=allow_filter_mismatch)
     return b.run(shard_indices=shard_indices, shard_seed=shard_seed, n_shards=n_shards)
 
 
@@ -819,6 +880,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--meta-cache", type=Path, default=None,
                    help=f"/paper/batch result cache (None: <shard-cache>/{META_CACHE_NAME})")
     p.add_argument("--no-meta-cache", action="store_true", help="do not read or write the metadata cache")
+    p.add_argument("--allow-filter-mismatch", action="store_true",
+                   help="log changed build parameters or records outside active filters and keep existing records")
     p.add_argument("--stats-only", action="store_true",
                    help="print corpus statistics of an existing --out file and exit (no network)")
     return p
@@ -845,7 +908,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             stats = build_corpus(out_path=args.out, n_papers=args.n_papers, client=client, filt=filt,
                                  shard_indices=indices, shard_seed=args.shard_seed, n_shards=args.n_shards,
                                  shard_cache=args.shard_cache, dataset=args.dataset, release=args.release,
-                                 batch_size=args.batch_size, meta_cache_path=meta_cache)
+                                 batch_size=args.batch_size, meta_cache_path=meta_cache,
+                                 allow_filter_mismatch=args.allow_filter_mismatch)
     except (S2Error, ValueError, IndexError, RuntimeError, OSError) as e:
         log(f"error: {type(e).__name__}: {e}")
         return 1

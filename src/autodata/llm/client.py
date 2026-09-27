@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import random
@@ -38,6 +38,8 @@ class ChatResult:
     usage: dict[str, int]
     raw: dict[str, Any]
     latency_s: float
+    # Usage of the returned request, separate from aggregate retry accounting.
+    last_request_usage: dict[str, int] = field(default_factory=dict)
 
 
 class _EmptyResponseError(RuntimeError):
@@ -181,7 +183,7 @@ class LLMClient:
             content=message.get("content"),
             reasoning=message.get("reasoning_content") or message.get("reasoning"),
             tool_calls=calls, finish_reason=choice.get("finish_reason"),
-            usage=usage, raw=raw, latency_s=latency_s,
+            usage=usage, raw=raw, latency_s=latency_s, last_request_usage=dict(usage),
         )
 
     # Compatibility aliases for existing callers and retry-delay test hooks.

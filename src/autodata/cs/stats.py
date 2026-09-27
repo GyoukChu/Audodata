@@ -13,8 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from autodata.cs.evaluate_rubric import compute_question_hash, legacy_question_hash
 
-def _load_summaries(root: Path, filename: str) -> list[dict[str, Any]]:
+
+def _load_summaries(root: Path, filename: str, *, with_workdir: bool = False) -> list[dict[str, Any]]:
     newest: dict[str, dict[str, Any]] = {}
 
     def finished_at(summary: dict) -> float:
@@ -40,6 +42,8 @@ def _load_summaries(root: Path, filename: str) -> list[dict[str, Any]]:
             continue
         paper_id = summary["paper_id"]
         if paper_id not in newest or finished_at(summary) >= finished_at(newest[paper_id]):
+            if with_workdir:
+                summary["_workdir"] = str(p.parent)
             newest[paper_id] = summary
     return list(newest.values())
 
@@ -115,8 +119,41 @@ def _table1(items: list[dict], rounds: list[dict]) -> dict[str, Any]:
     }
 
 
+def _acceptance_scores(summary: dict, rd: dict) -> dict:
+    """Prefer the earliest accepting report for this candidate, including legacy hashes."""
+    fallback = {**rd, "scores_source": "summary"}
+    try:
+        hashes = {compute_question_hash(rd), legacy_question_hash(rd)}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return fallback
+    reports = []
+    for path in Path(summary["_workdir"]).glob("eval_attempts/run_*/report.json"):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(report, dict) or report.get("all_passed") is not True or report.get("question_hash") not in hashes:
+                continue
+            value = report.get("started_at")
+            if isinstance(value, (int, float)):
+                started = float(value)
+            else:
+                dt = datetime.fromisoformat(value)
+                started = (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+            reports.append((started, str(path), report))
+        except (OSError, ValueError, TypeError, OverflowError):
+            continue
+    if not reports:
+        return fallback
+    _, path, report = min(reports, key=lambda item: (item[0], item[1]))
+    scores = {key: report.get(key) for key in ("weak_avg", "strong_avg", "gap")}
+    for role in ("weak", "strong"):
+        scores[f"{role}_scores"] = report.get(f"{role}_scores")
+        if scores[f"{role}_scores"] is None:
+            scores[f"{role}_scores"] = [attempt.get("score") for attempt in report.get(f"{role}_attempts", [])]
+    return {**rd, **scores, "scores_source": "report", "scores_report": path}
+
+
 def summarize_agentic(root: str | Path) -> dict[str, Any]:
-    runs = _load_summaries(Path(root), "harness_summary.json")
+    runs = _load_summaries(Path(root), "harness_summary.json", with_workdir=True)
     runs, cohort = _cohort_counts(Path(root), "harness_summary.json", runs,
                                   is_completed=lambda r: bool(r.get("completed", True)),
                                   is_accepted=lambda r: bool(r.get("accepted")))
@@ -126,10 +163,12 @@ def summarize_agentic(root: str | Path) -> dict[str, Any]:
     def _acc_round(r: dict) -> dict:
         index = r.get("accepted_round")
         rounds = r.get("rounds") or []
-        return rounds[index - 1] if isinstance(index, int) and 0 < index <= len(rounds) else {}
+        rd = rounds[index - 1] if isinstance(index, int) and 0 < index <= len(rounds) else {}
+        return _acceptance_scores(r, rd)
 
     acc_rounds = [_acc_round(r) for r in accepted]
-    final_rounds = [_acc_round(r) for r in final]
+    by_paper = {r["paper_id"]: rd for r, rd in zip(accepted, acc_rounds)}
+    final_rounds = [by_paper[r["paper_id"]] if r["paper_id"] in by_paper else _acc_round(r) for r in final]
     all_rounds = [rd for r in runs for rd in r.get("rounds", [])]
     failed_rounds = [rd for rd in all_rounds if rd.get("failure_mode") != "ACCEPTED"]
     modes = Counter(rd.get("failure_mode") for rd in failed_rounds)
@@ -144,6 +183,13 @@ def summarize_agentic(root: str | Path) -> dict[str, Any]:
         "root": str(root),
         "n_papers": len(runs),
         "n_accepted": len(accepted),
+        "n_qv_unbound": sum(rd.get("qv_bound") is False for rd in acc_rounds),
+        "n_report_backed": sum(rd["scores_source"] == "report" for rd in acc_rounds),
+        "n_summary_backed": sum(rd["scores_source"] == "summary" for rd in acc_rounds),
+        "items": [{"paper_id": r["paper_id"], "accepted_round": r.get("accepted_round"),
+                   **{key: rd.get(key) for key in ("weak_avg", "strong_avg", "gap", "weak_scores", "strong_scores",
+                                                  "scores_source", "scores_report")}}
+                  for r, rd in zip(accepted, acc_rounds)],
         "acceptance_rate": round(len(accepted) / len(runs), 4) if runs else None,
         "n_final_accepted": len(final),
         "table1": _table1(accepted, acc_rounds),

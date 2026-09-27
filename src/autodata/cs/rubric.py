@@ -28,6 +28,7 @@ class ScoreBreakdown:
 
 
 def parse_rubric(obj: Any) -> list[RubricItem]:
+    """Validate scoreable integer weights and their signs; Fig. 8 ranges are advisory."""
     if not isinstance(obj, list) or not obj:
         raise RubricError("rubric must be a non-empty list")
     items: list[RubricItem] = []

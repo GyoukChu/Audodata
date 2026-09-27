@@ -191,7 +191,7 @@ WEAK_PASSED (weak_avg 48.1% < 50%)
 
 ### 2.5 `autodata/data/s2_client.py`, `autodata/data/build_corpus.py`  (owner: subagent C)
 Semantic Scholar API, key in env `S2_API_KEY` (loaded by env.sh). HARD RULE: one process-wide limiter, minimum
-`S2_MIN_INTERVAL` seconds between ANY two requests (default 3.0; the nominal limit is 1 req/s but 429s were observed at
+`S2_MIN_INTERVAL` seconds between ANY two requests (default and minimum 3.0; the nominal limit is 1 req/s but 429s were observed at
 1.3 s spacing), exponential backoff on 429 (5 s, 10, 20, 40, 80, 160; jitter; max 8 tries), never parallel requests.
 Endpoints: `GET https://api.semanticscholar.org/datasets/v1/release/latest/dataset/s2orc_v2` (header `x-api-key`) →
 {"release_id","README","files":[presigned S3 URLs]}; `POST https://api.semanticscholar.org/graph/v1/paper/batch?fields=
@@ -207,7 +207,9 @@ s2FieldsOfStudy categories AND a non-empty abstract AND body length in range, de
 {"paper_id": "s2_<corpusid>", "corpus_id", "title", "abstract", "year", "publication_date", "venue", "s2_fields",
 "external_ids", "authors", "body_text", "n_body_chars", "shard", "release_id"}. Also `autodata.data.paper_text(record)
 -> str` = "Title: ...\n\nAbstract: ...\n\n<body_text>" and `iter_corpus(path)`. Write progress + counts to stderr; resumable
-(append-only; skip ids already in the output).
+(append-only; skip ids already in the output). Before counting existing records, validate their year, field,
+abstract/body lengths, release, and shard membership. Store build parameters in `<output>.meta.json` and compare them
+on resume; `--allow-filter-mismatch` logs and retains incompatible records/parameters, with prior parameters in history.
 
 ### 2.6 `autodata/cs/prompts.py`, `run_paper.py`, `pipeline.py`, `cot_baseline.py`, `stats.py`  (owner: orchestrator)
 Uses everything above. Prompts live in `prompts/cs/*.md` (verbatim from the paper/README; main_agent.md has
@@ -217,9 +219,20 @@ rendered from `AcceptancePreset`).
 `(root or workdir.parent)/_archive/<paper>.<YYYYmmdd-HHMMSS>`; same-second collisions get `.1`, `.2`, etc. Call while holding
 `PaperLock(workdir)`. Locks live at `<run-root>/_locks/<paper>.lock`, use nonblocking `flock`, remain on disk after release,
 and are acquired inside the paper concurrency semaphore before rechecking resume state or archiving. Every rerun archives,
-including retries after errors. With retry_errors=True, only explicitly completed summaries without errors/error stop
-reasons are resumable; keep-errors preserves the existing opt-out. Escaping per-paper exceptions write incomplete crash
+including retries after errors, except repairs that retain the frozen candidate. With retry_errors=True, explicitly
+completed summaries without errors/error stop reasons are resumable, as are accepted candidates whose final QV completed;
+keep-errors preserves the existing opt-out. Escaping per-paper exceptions write incomplete crash
 summaries and do not abort the corpus; usage_agents.json is written in finally.
+
+CoT resume uses the shared driver's `needs_repair(cfg, prev)` hook: matching summary and `eval_input.json` question,
+context, and rubric freeze the candidate. Repair skips the challenger and runs only incomplete QV and missing/errored
+weak or strong reports, using `--weak-only` or `--strong-only --force-strong` with cached weak evaluation reuse.
+Incomplete QV adds an error; CoT completion requires no errors and both averages. Repairs preserve generation config
+and prompt fingerprints, recording repair fingerprints and time separately even on failure. Cohort manifests compare
+config, prompts, corpus hash, and known corpus paths; overrides record history, and new paper IDs extend the cohort.
+Resumed summaries with fingerprints absent from the current manifest and history are accumulated in `imports` with
+harness version, available prompt fingerprint, and paper IDs under the cohort lock. Changed rendered paper text forces
+archiving and a fresh attempt before either reuse or repair.
 `stats` loads only direct paper workdirs, excluding `_...` and `.old.` directories, and deduplicates by latest finished_at.
 `n_incomplete` aliases the existing incomplete count; `n_skipped_locked` counts distinct latest locked skips, including
 corpus-log-only skips that cannot be written into another runner's workspace.

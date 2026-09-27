@@ -10,6 +10,7 @@ import asyncio
 import json
 import sys
 import time
+from fractions import Fraction
 from functools import partial
 from pathlib import Path
 
@@ -49,54 +50,107 @@ async def _eval(cfg: AppConfig, workdir: Path, mode: str) -> tuple[str, dict | N
     return stdout, report, rc
 
 
+def _qv_incomplete(summary: dict) -> bool:
+    return bool(summary.get("qv_incomplete") or summary.get("qv_passed") is None
+                or "quality verifier incomplete" in (summary.get("errors") or []))
+
+
+def _report_incomplete(summary: dict, name: str) -> bool:
+    report = summary.get(f"{name}_report")
+    return (not isinstance(report, dict) or bool(report.get("error"))
+            or report.get(f"{name}_avg") is None
+            or any(error.startswith(f"{name} eval ") for error in summary.get("errors") or []))
+
+
+def _frozen_candidate_matches(summary: dict, workdir: Path) -> bool:
+    fields = ("context", "question", "rubric")
+    if not all(key in summary and summary[key] is not None for key in fields):
+        return False
+    try:
+        candidate = json.loads((workdir / "eval_input.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(candidate, dict) and all(key in candidate and candidate[key] == summary[key] for key in fields)
+
+
+def _needs_repair(cfg: AppConfig, prev: dict, *, root: Path) -> bool:
+    return (_frozen_candidate_matches(prev, root / str(prev.get("paper_id", "")))
+            and (_qv_incomplete(prev) or any(_report_incomplete(prev, name) for name in ("weak", "strong"))))
+
+
 async def run_one(cfg: AppConfig, paper: PaperInput, workdir: Path, clients: dict[str, LLMClient],
-                  prompts: PromptSet, prompts_dir_abs: Path, log=print) -> dict:
+                  prompts: PromptSet, prompts_dir_abs: Path, log=print, *,
+                  repair: bool = False, prev: dict | None = None) -> dict:
     t0 = time.time()
+    if repair and (prev is None or not _frozen_candidate_matches(prev, workdir)):
+        raise ValueError("CoT repair requires a frozen candidate matching eval_input.json")
     ws = prepare_workspace(cfg, paper, workdir, prompts_dir_abs)
     out: dict = {"paper_id": paper.paper_id, "title": paper.title, "meta": paper.meta, "errors": []}
-    # 1) challenger, single shot, verbatim round-1 prompt
-    ch = Agent(name="challenger_01", system_prompt=prompts.challenger_system(),
-               tools=[make_bash_tool(ws), make_read_tool(ws)], llm=clients["challenger"],
-               max_steps=cfg.run.subagent_max_steps, transcript_path=workdir / "trajectory" / "challenger_01.jsonl")
-    res = await ch.run(CHALLENGER_ROUND1_PROMPT)
-    cj = parse_challenger_output(res.final_text or "")
-    out["challenger_stop_reason"] = res.stop_reason
-    out["challenger_parsed"] = cj is not None
-    out["usage"] = {"challenger": res.usage}
-    if not cj:
-        out["errors"].append("challenger output could not be parsed")
-        out["wall_time_s"] = round(time.time() - t0, 1)
-        return out
-    out.update({k: cj.get(k) for k in ("question_type", "reasoning_skills", "context", "question", "reference_answer", "rubric")})
-    out["question_chars"] = len(cj.get("question") or "")
-    out["n_rubric_items"] = len(cj.get("rubric") or []) if isinstance(cj.get("rubric"), list) else None
-    eval_input = {"question_type": cj.get("question_type"), "context": cj.get("context"), "question": cj.get("question"),
-                  "rubric": cj.get("rubric")}
-    (workdir / "eval_input.json").write_text(json.dumps(eval_input, ensure_ascii=False, indent=1), encoding="utf-8")
+    if repair:
+        out.update(prev)
+        out["errors"] = [error for error in prev.get("errors") or [] if not error.startswith("repair:")]
+        out["usage"] = dict(prev.get("usage") or {})
+        out["repaired"] = []
+        cj = out
+    else:
+        # 1) challenger, single shot, verbatim round-1 prompt
+        ch = Agent(name="challenger_01", system_prompt=prompts.challenger_system(),
+                   tools=[make_bash_tool(ws), make_read_tool(ws)], llm=clients["challenger"],
+                   max_steps=cfg.run.subagent_max_steps, transcript_path=workdir / "trajectory" / "challenger_01.jsonl")
+        res = await ch.run(CHALLENGER_ROUND1_PROMPT)
+        cj = parse_challenger_output(res.final_text or "")
+        out["challenger_stop_reason"] = res.stop_reason
+        out["challenger_parsed"] = cj is not None
+        out["usage"] = {"challenger": res.usage}
+        if not cj:
+            out["errors"].append("challenger output could not be parsed")
+            out["wall_time_s"] = round(time.time() - t0, 1)
+            return out
+        out.update({k: cj.get(k) for k in ("question_type", "reasoning_skills", "context", "question", "reference_answer", "rubric")})
+        out["question_chars"] = len(cj.get("question") or "")
+        out["n_rubric_items"] = len(cj.get("rubric") or []) if isinstance(cj.get("rubric"), list) else None
+        eval_input = {"question_type": cj.get("question_type"), "context": cj.get("context"), "question": cj.get("question"),
+                      "rubric": cj.get("rubric")}
+        (workdir / "eval_input.json").write_text(json.dumps(eval_input, ensure_ascii=False, indent=1), encoding="utf-8")
     # 2) quality verifier (same prompt as the agentic pipeline)
-    qv = Agent(name="quality_verifier_01", system_prompt=prompts.quality_verifier_system(),
-               tools=[make_bash_tool(ws), make_read_tool(ws)], llm=clients["quality_verifier"],
-               max_steps=cfg.run.subagent_max_steps, transcript_path=workdir / "trajectory" / "quality_verifier_01.jsonl")
-    qres = await qv.run(prompts.qv_request(str(cj.get("question_type") or ""), cj.get("context") or "",
-                                           cj.get("question") or "", json.dumps(cj.get("rubric"), ensure_ascii=False, indent=1)))
-    qparsed = parse_qv_output(qres.final_text or "")
-    if qres.stop_reason != "final":
-        qparsed = {**qparsed, "overall": False, "incomplete": True}
-    out["qv_passed"] = qparsed.get("overall")
-    out["qv_checks"] = qparsed.get("checks")
-    out["qv_contradiction"] = qparsed.get("contradiction")
-    out["qv_feedback"] = qparsed.get("feedback")
-    out["usage"]["quality_verifier"] = qres.usage
+    if not repair or _qv_incomplete(prev):
+        qv = Agent(name="quality_verifier_01", system_prompt=prompts.quality_verifier_system(),
+                   tools=[make_bash_tool(ws), make_read_tool(ws)], llm=clients["quality_verifier"],
+                   max_steps=cfg.run.subagent_max_steps, transcript_path=workdir / "trajectory" / "quality_verifier_01.jsonl")
+        qres = await qv.run(prompts.qv_request(str(cj.get("question_type") or ""), cj.get("context") or "",
+                                             cj.get("question") or "", json.dumps(cj.get("rubric"), ensure_ascii=False, indent=1)))
+        qparsed = parse_qv_output(qres.final_text or "")
+        incomplete = qres.stop_reason != "final" or qparsed.get("overall") is None
+        out["errors"] = [error for error in out["errors"] if error != "quality verifier incomplete"]
+        if incomplete:
+            out["errors"].append("quality verifier incomplete")
+        out["qv_incomplete"] = incomplete
+        out["qv_passed"] = False if incomplete else qparsed["overall"]
+        out["qv_checks"] = qparsed.get("checks")
+        out["qv_contradiction"] = qparsed.get("contradiction")
+        out["qv_feedback"] = qparsed.get("feedback")
+        out["usage"]["quality_verifier"] = qres.usage
+        if repair:
+            out["repaired"].append("quality_verifier")
     out["final_filter"] = final_filter(cfg, cj.get("context") or "", cj.get("rubric"))
     out["final_filter_passed"] = bool(out["qv_passed"]) and out["final_filter"]["context_ok"] and out["final_filter"]["rubric_ok"]
     # 3) both solvers, always (statistics need weak AND strong for every item)
-    w_out, w_rep, w_rc = await _eval(cfg, workdir, "weak-only")
-    s_out, s_rep, s_rc = await _eval(cfg, workdir, "strong-only")
-    for name, rep, rc, txt in (("weak", w_rep, w_rc, w_out), ("strong", s_rep, s_rc, s_out)):
-        if rep is not None and (rep.get("error") or rc not in (0, None)):
-            out["errors"].append(f"{name} eval error: {rep.get('error') or rc}: {txt[:200]}")
-    out["weak_report"] = w_rep
-    out["strong_report"] = s_rep
+    for name in ("weak", "strong"):
+        if repair and not _report_incomplete(prev, name):
+            continue
+        try:
+            txt, rep, rc = await _eval(cfg, workdir, f"{name}-only")
+        except Exception as exc:
+            txt, rep, rc = f"{type(exc).__name__}: {exc}", None, None
+        out["errors"] = [error for error in out["errors"] if not error.startswith(f"{name} eval ")]
+        out[f"{name}_report"] = rep
+        if not rep:
+            out["errors"].append(f"{name} eval failed: {txt[:300]}")
+        elif rep.get("error") or rc not in (0, None) or rep.get(f"{name}_avg") is None:
+            out["errors"].append(f"{name} eval error: {rep.get('error') or rc or 'missing average'}: {txt[:200]}")
+        if repair:
+            out["repaired"].append(name)
+    w_rep, s_rep = out["weak_report"], out["strong_report"]
     out["weak_avg"] = w_rep.get("weak_avg") if w_rep else None
     out["strong_avg"] = s_rep.get("strong_avg") if s_rep else None
     out["gap"] = s_rep.get("gap") if s_rep else None
@@ -104,11 +158,24 @@ async def run_one(cfg: AppConfig, paper: PaperInput, workdir: Path, clients: dic
     out["strong_passed"] = s_rep.get("strong_passed") if s_rep else None
     out["gap_passed"] = s_rep.get("gap_passed") if s_rep else None
     out["all_solver_criteria_passed"] = s_rep.get("all_passed") if s_rep else None
+    if repair and "weak" in out["repaired"] and "strong" not in out["repaired"] and not out["errors"]:
+        # The retained strong report predates the repaired weak stage. Combine its
+        # verdict with the new weak verdict without sampling either solver again.
+        def exact_average(report: dict, role: str) -> Fraction:
+            attempts = report.get(f"{role}_attempts") or []
+            if not attempts:
+                return Fraction(str(report[f"{role}_avg"]))
+            scores = [max(Fraction(0), min(Fraction(1), Fraction(
+                attempt["breakdown"]["earned"] - attempt["breakdown"]["penalty"],
+                attempt["breakdown"]["max_positive"],
+            ))) for attempt in attempts]
+            return sum(scores) / len(scores)
+
+        gap = exact_average(s_rep, "strong") - exact_average(w_rep, "weak")
+        out["gap"] = float(gap)
+        out["gap_passed"] = gap >= Fraction(str(cfg.acceptance.gap_min))
+        out["all_solver_criteria_passed"] = bool(out["weak_passed"] and out["strong_passed"] and out["gap_passed"])
     out["would_be_accepted"] = bool(out["qv_passed"]) and bool(out["all_solver_criteria_passed"])
-    if not w_rep:
-        out["errors"].append(f"weak eval failed: {w_out[:300]}")
-    if not s_rep:
-        out["errors"].append(f"strong eval failed: {s_out[:300]}")
     out["wall_time_s"] = round(time.time() - t0, 1)
     log(f"[{paper.paper_id}] CoT: qv={out['qv_passed']} weak={out['weak_avg']} strong={out['strong_avg']} gap={out['gap']}")
     return out
@@ -124,6 +191,7 @@ async def run_corpus(cfg: AppConfig, papers: list[PaperInput], root: Path, *, co
     return await run_papers(cfg, papers, root, concurrency=concurrency, resume=resume, retry_errors=True,
                             summary_filename="cot_summary.json", is_done=is_done, run_one=partial(run_one, cfg),
                             roles=("challenger", "quality_verifier"), prompts_dir=prompts_dir,
+                            needs_repair=partial(_needs_repair, root=root),
                             allow_config_mismatch=allow_config_mismatch, corpus_path=corpus_path)
 
 
@@ -138,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--concurrency", type=int)
     ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--prompts-dir")
-    ap.add_argument("--allow-config-mismatch", action="store_true", help="record changed config/prompts in the cohort history instead of refusing to resume")
+    ap.add_argument("--allow-config-mismatch", action="store_true", help="record changed config/prompts/corpus in the cohort history instead of refusing to resume")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     ids = set(args.paper_ids.split(",")) if args.paper_ids else None

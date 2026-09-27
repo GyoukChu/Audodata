@@ -236,7 +236,8 @@ def test_limiter_cooldown_is_global() -> None:
 
 
 def test_limiter_threads_never_overlap() -> None:
-    lim = RateLimiter(0.03)
+    clock = FakeClock()
+    lim = RateLimiter(3.0, clock=clock.now, sleep=clock.sleep)
     def worker() -> None:
         for _ in range(3):
             with lim.slot():
@@ -248,17 +249,19 @@ def test_limiter_threads_never_overlap() -> None:
         t.join()
     hist = sorted(lim.history)
     assert len(hist) == 12
-    assert all(b[0] - a[1] >= 0.03 for a, b in zip(hist, hist[1:]))
+    assert all(b[0] - a[1] >= 3.0 for a, b in zip(hist, hist[1:]))
 
 
 def test_limiter_file_gate_spaces_separate_instances(tmp_path: Path) -> None:
     lock = tmp_path / "s2.lock"
-    a, b = RateLimiter(0.3, lock_path=lock), RateLimiter(0.3, lock_path=lock)   # like two processes
+    clock = FakeClock()
+    a, b = [RateLimiter(3.0, lock_path=lock, clock=clock.now, sleep=clock.sleep, wall_clock=clock.now)
+            for _ in range(2)]   # like two processes
     with a.slot():
         pass
     with b.slot():
         pass
-    assert b.history[0][0] - a.history[0][1] >= 0.3 - 0.01
+    assert b.history[0][0] - a.history[0][1] >= 3.0
 
 
 def test_min_interval_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,7 +270,7 @@ def test_min_interval_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S2_MIN_INTERVAL", "4.5")
     assert min_interval_from_env() == 4.5
     monkeypatch.setenv("S2_MIN_INTERVAL", "0.2")
-    assert min_interval_from_env() == 1.0      # floor
+    assert min_interval_from_env() == 3.0      # floor
     monkeypatch.setenv("S2_MIN_INTERVAL", "fast")
     assert min_interval_from_env() == 3.0
 

@@ -1,12 +1,41 @@
 """Evaluate research questions, with weak-first compute saving (paper §3.1)."""
 from __future__ import annotations
 
+import os
+import sys
+
+
+def _die_with_parent() -> None:
+    """Arm Linux parent-death handling before evaluator dependencies are imported."""
+    if not sys.platform.startswith("linux"):
+        return
+    expected_parent = os.environ.get("AUTODATA_PARENT_PID", str(os.getppid()))
+    try:
+        expected_parent = int(expected_parent)
+        import ctypes
+        import signal
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            raise OSError(ctypes.get_errno(), "PR_SET_PDEATHSIG failed")
+        if os.getppid() != expected_parent:
+            raise RuntimeError("parent pid mismatch after arming parent-death signal")
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"EVALUATOR_PARENT_ERROR: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(5)
+
+
+# Library imports in the harness must not arm a signal on the harness itself.
+# Both the module CLI and harness-spawned imports arm before heavy dependencies.
+if __name__ == "__main__" or "AUTODATA_PARENT_PID" in os.environ:
+    _die_with_parent()
+
 import argparse
 import hashlib
 import json
 import math
 import re
-import sys
+import unicodedata
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -189,7 +218,7 @@ def _run_stage(
 def _latest_weak(
     output_dir: Path, question_hash: str, rubric: list[RubricItem],
     *, config: _ApiConfig | None = None, config_sha1: str | None = None,
-    prompts_dir: str | Path | None = None,
+    prompts_dir: str | Path | None = None, legacy_hash: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None, Path | None]:
     # Without the current configuration there is no safe provenance comparison.
     if config is None or config_sha1 is None or prompts_dir is None:
@@ -202,7 +231,10 @@ def _latest_weak(
     for _, path in sorted(candidates, reverse=True):
         try:
             report = _read_object(path)
-            if report.get("question_hash") != question_hash:
+            # Reports retain the legacy field for running harnesses; use their
+            # canonical field too when only JSON layout or trailing whitespace changed.
+            identities = {report.get("question_hash"), report.get("question_hash_canonical")} - {None}
+            if not identities.intersection({question_hash, legacy_hash} - {None}):
                 continue
             if (report.get("acceptance") != config.acceptance.model_dump()
                     or report.get("eval") != config.eval.model_dump()):
@@ -227,10 +259,23 @@ def _latest_weak(
     return [], None, None
 
 
-def compute_question_hash(data: dict) -> str:
-    """Return the evaluator's legacy SHA-1, ignoring non-question input fields."""
+def legacy_question_hash(data: dict) -> str:
+    """Identity used by existing evaluator reports before canonicalisation."""
     question = {key: data[key] for key in ("context", "question", "rubric")}
     return hashlib.sha1(json.dumps(question).encode("utf-8")).hexdigest()
+
+
+def compute_question_hash(data: dict) -> str:
+    """Hash canonical question content, independent of JSON layout and metadata."""
+    def normalise(text: str) -> str:
+        return "\n".join(line.rstrip() for line in
+                         unicodedata.normalize("NFC", text).replace("\r\n", "\n").split("\n"))
+
+    question = {key: normalise(data[key]) for key in ("context", "question")}
+    question["rubric"] = [dict(criterion=normalise(item.criterion), weight=item.weight,
+                               category=normalise(item.category)) for item in parse_rubric(data["rubric"])]
+    canonical = json.dumps(question, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
 
 def assess_attempts(
@@ -400,18 +445,6 @@ def _render_report(report: dict[str, Any], preset: AcceptancePreset, rubric: lis
     return "\n".join(lines) + "\n"
 
 
-def _die_with_parent() -> None:
-    """Linux: deliver SIGTERM to this process when the parent (the harness) dies (review finding #8)."""
-    try:
-        import ctypes
-        import signal
-
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG = 1
-    except Exception:
-        pass
-
-
 def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None = None) -> int:
     if transport is None:
         _die_with_parent()
@@ -447,10 +480,14 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
         output_dir = args.output_dir.resolve()
         run_dir = _new_run(output_dir, mode)
         question = {key: data[key] for key in ("context", "question", "rubric")}
-        question_hash = compute_question_hash(data)
+        # Report field `question_hash` keeps the legacy identity so that harness processes started before the
+        # canonical hash existed still verify new reports; `question_hash_canonical` carries the new identity.
+        # Harness and statistics accept either value.
+        question_hash = legacy_question_hash(data)
+        question_hash_canonical = compute_question_hash(data)
         started = time.perf_counter()
         report: dict[str, Any] = {
-            "mode": mode, "question_hash": question_hash, **question,
+            "mode": mode, "question_hash": question_hash, "question_hash_canonical": question_hash_canonical, **question,
             "input_path": str(input_path), "input_sha1": hashlib.sha1(input_bytes).hexdigest(),
             "config_path": str(config_path), "config_sha1": hashlib.sha1(config_bytes).hexdigest(),
             "n_attempts_required": config.eval.n_attempts,
@@ -464,7 +501,7 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
         if mode == "strong-only":
             attempts, previous, source = _latest_weak(
                 output_dir, question_hash, rubric, config=config,
-                config_sha1=report["config_sha1"], prompts_dir=prompts,
+                config_sha1=report["config_sha1"], prompts_dir=prompts, legacy_hash=question_hash_canonical,
             )
             report.update(weak_attempts=attempts, weak_source_report=str(source) if source else None,
                           weak_source_run_dir=str(source.parent) if source else None)
@@ -473,7 +510,9 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
         for role in (("strong",) if mode == "strong-only" else ("weak",) if mode == "weak-only"
                      else ("weak", "strong")):
             report.update(assess_attempts(rubric, report["weak_attempts"], report["strong_attempts"], config.acceptance))
-            if role == "strong" and not report["weak_passed"]:
+            if role == "strong" and not report["weak_passed"] and not args.force_strong:
+                # Sec 3.1: the strong solver runs only when the weak solver passes. The CoT baseline needs both
+                # columns on every item (Table 1) and passes --force-strong, which bypasses this gate too.
                 break
             if mode == "strong-only" and not args.force_strong and (not previous or previous.get("weak_passed") is not True):
                 break

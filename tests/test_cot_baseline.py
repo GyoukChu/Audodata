@@ -39,6 +39,7 @@ def test_single_shot_cot_evaluates_both_solvers_even_when_qv_fails(tmp_path, qv_
     assert summary["final_filter"] == {
         "context_chars": len(CHALLENGER_JSON["context"]), "n_rubric_items": 11,
         "n_positive": 8, "n_negative": 3, "context_ok": True, "rubric_ok": True, "rubric_error": None,
+        "weights_in_spec": True,
     }
     assert json.loads((root / "paper/cot_summary.json").read_text()) == summary
     assert [json.loads(line) for line in (root / "summary.jsonl").read_text().splitlines()] == results
@@ -135,3 +136,101 @@ def test_cli_no_resume_archives_completed_workdir(tmp_path):
     current = json.loads((root / "paper/cot_summary.json").read_text())
     assert current["weak_avg"] == 0.15 and current["strong_avg"] == 1.0 and current["errors"] == []
     assert summarize_cot(root)["n_papers"] == 1
+
+
+@pytest.mark.parametrize("incomplete", ["unparseable", "length"])
+def test_incomplete_qv_is_an_error_and_resume_repairs_only_qv(tmp_path, incomplete):
+    class IncompleteQV(Scenario):
+        broken = True
+
+        def __call__(self, req, idx):
+            response = super().__call__(req, idx)
+            if self.broken and _role(req) == "qv":
+                return text_response("unfinished" if incomplete == "unparseable" else QV_PASS,
+                                     finish_reason="stop" if incomplete == "unparseable" else "length")
+            return response
+
+    scenario = IncompleteQV()
+    root = tmp_path / "cot"
+    with FakeServer(scenario) as server:
+        cfg = _config(server.base_url, tmp_path)
+        first, = asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1))
+        assert first["errors"] == ["quality verifier incomplete"]
+        assert first["qv_incomplete"] is True and first["qv_passed"] is False
+        assert first["weak_avg"] == 0.15 and first["strong_avg"] == 1.0
+        candidate = (root / "paper/eval_input.json").read_bytes()
+        challenger = (root / "paper/trajectory/challenger_01.jsonl").read_bytes()
+        before = len(scenario.calls)
+        scenario.broken = False
+        result, = asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1))
+        after = len(scenario.calls)
+        assert asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1)) == [result]
+        assert len(scenario.calls) == after
+    assert result["errors"] == [] and result["qv_passed"] is True and result["qv_incomplete"] is False
+    assert result["repaired"] == ["quality_verifier"]
+    assert result["weak_report"] == first["weak_report"] and result["strong_report"] == first["strong_report"]
+    assert all(role == "qv" for role, _ in scenario.calls[before:])
+    assert (root / "paper/eval_input.json").read_bytes() == candidate
+    assert (root / "paper/trajectory/challenger_01.jsonl").read_bytes() == challenger
+    assert not (root / "_archive").exists()
+
+
+@pytest.mark.parametrize("stage,errored", [("weak", False), ("weak", True), ("strong", False), ("strong", True)])
+def test_resume_repairs_only_missing_or_errored_solver_on_frozen_candidate(tmp_path, monkeypatch, stage, errored):
+    scenario = Scenario()
+    root = tmp_path / "cot"
+    real_eval = cot_baseline._eval
+    fail = True
+    modes = []
+
+    async def evaluate(cfg, workdir, mode):
+        modes.append(mode)
+        if fail and mode == f"{stage}-only":
+            return "incomplete stage", {"error": "solver failed"} if errored else None, 1
+        return await real_eval(cfg, workdir, mode)
+
+    monkeypatch.setattr(cot_baseline, "_eval", evaluate)
+    with FakeServer(scenario) as server:
+        cfg = _config(server.base_url, tmp_path)
+        first, = asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1))
+        assert first["errors"]
+        candidate = (root / "paper/eval_input.json").read_bytes()
+        before = len(scenario.calls)
+        fail = False
+        modes.clear()
+        result, = asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1))
+        after = len(scenario.calls)
+        assert asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1)) == [result]
+        assert len(scenario.calls) == after
+    assert modes == [f"{stage}-only"]
+    assert result["repaired"] == [stage] and result["errors"] == []
+    assert result["weak_avg"] == 0.15 and result["strong_avg"] == 1.0
+    assert result["gap"] == pytest.approx(0.85) and result["would_be_accepted"]
+    assert not any(role in ("challenger", "qv") for role, _ in scenario.calls[before:])
+    expected_model = "qwen3.8-27b" if stage == "strong" else "qwen3.5-4b"
+    assert [req["model"] for role, req in scenario.calls[before:] if role == "solver"] == [expected_model] * 3
+    assert (root / "paper/eval_input.json").read_bytes() == candidate
+    assert not (root / "_archive").exists()
+    other = "weak" if stage == "strong" else "strong"
+    assert result[f"{other}_report"] == first[f"{other}_report"]
+
+
+@pytest.mark.parametrize("field", ["context", "question", "rubric"])
+def test_resume_does_not_repair_when_eval_input_differs(tmp_path, field):
+    scenario = Scenario()
+    root = tmp_path / "cot"
+    with FakeServer(scenario) as server:
+        cfg = _config(server.base_url, tmp_path)
+        first, = asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1))
+        first.update(strong_avg=None, strong_report=None)
+        (root / "paper/cot_summary.json").write_text(json.dumps(first))
+        path = root / "paper/eval_input.json"
+        candidate = json.loads(path.read_text())
+        candidate[field] = [] if field == "rubric" else "different"
+        path.write_text(json.dumps(candidate))
+        before = len(scenario.calls)
+        result, = asyncio.run(cot_baseline.run_corpus(cfg, [_paper()], root, concurrency=1))
+    assert result["errors"] == [] and "repaired" not in result
+    assert any(role == "challenger" for role, _ in scenario.calls[before:])
+    archived, = (root / "_archive").glob("paper.*/eval_input.json")
+    assert json.loads(archived.read_text()) == candidate

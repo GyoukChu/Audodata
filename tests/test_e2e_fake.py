@@ -2,7 +2,8 @@
 
 Exercises: main agent tool loop (task/bash/write), challenger + QV subagents (cat ./paper.txt), the evaluate_rubric.py
 CLI as a real isolated subprocess (solvers x3 + judge), harness round tracking, harness-verified acceptance, guardrails
-(write allow-list, planted-module isolation, QV binding/contradictions, strong-without-weak) and the end-of-loop QV.
+(write allow-list, planted-module isolation, QV contradictions, strong-without-weak), informational binding diagnostics,
+and the end-of-loop QV.
 No GPU, no network (localhost only).
 """
 from __future__ import annotations
@@ -247,13 +248,20 @@ def test_qv_contradiction_blocks_acceptance(tmp_path: Path):
     assert any(e["kind"] == "accept_without_qv" for e in summary["guardrail_events"])
 
 
-def test_qv_must_review_the_evaluated_question(tmp_path: Path):
+def test_unbound_in_loop_qv_is_informational_and_final_qv_reviews_exact_candidate(tmp_path: Path):
     steps = happy_main_steps()
     steps[1] = tool_call_response([("task", {"description": "QV", "prompt": "Please verify the package (see eval_input.json).", "subagent_type": "quality_verifier"})])
     scenario = Scenario(main_steps=steps)
     summary, _ = _run(tmp_path, scenario)
-    assert summary["accepted"] is False
-    assert any(e["kind"] == "qv_not_bound" for e in summary["guardrail_events"])
+    assert summary["accepted"] is True and summary["final_accepted"] is True
+    assert summary["rounds"][0]["qv_bound"] is False
+    assert "question" in summary["rounds"][0]["qv_missing"]
+    assert any(e["kind"] == "qv_not_bound" and e["informational"] for e in summary["guardrail_events"])
+    final_request = [req for role, req in scenario.calls if role == "qv"][-1]
+    final_prompt = next(m["content"] for m in final_request["messages"] if m["role"] == "user")
+    assert CHALLENGER_JSON["question"] in final_prompt
+    assert CHALLENGER_JSON["context"] in final_prompt
+    assert json.dumps(CHALLENGER_JSON["rubric"], ensure_ascii=False, indent=1) in final_prompt
 
 
 def test_round_budget_and_challenger_refusal(tmp_path: Path):
@@ -303,27 +311,24 @@ def test_subagents_cannot_read_outside_the_paper_view(tmp_path: Path):
     assert summary["accepted"] is True  # the round itself still completes normally
 
 
-def test_state_machine_blocks_qv_shopping_reevaluation_and_weight_tampering(tmp_path: Path):
+def test_state_machine_blocks_shopping_and_records_weight_changes_informationally(tmp_path: Path):
     """Within a round: a second QV on the same question is refused, a completed evaluation is served from cache (no new
-    evaluator run), a question that is not the challenger's is refused, rubric weights changed after QV break the binding,
-    and nothing can be evaluated after acceptance."""
+    evaluator run), a question that is not the challenger's is refused, rubric weights changed after QV are recorded
+    as informational binding diagnostics, and nothing can be evaluated after acceptance."""
     tampered = json.loads(json.dumps(EVAL_INPUT))
-    tampered["rubric"][0]["weight"] = 10  # was 5: same criterion text, different weight -> QV binding must fail
+    tampered["rubric"][0]["weight"] = 10  # was 5: an informational mismatch with the in-loop QV prompt
     foreign = json.loads(json.dumps(EVAL_INPUT))
     foreign["question"] = "A question the challenger never wrote?"
     steps = [
         tool_call_response([("task", {"description": "challenger round 1", "prompt": "Generate ... ./paper.txt", "subagent_type": "challenger"})]),
         tool_call_response([("task", {"description": "QV round 1", "prompt": QV_PROMPT_FULL, "subagent_type": "quality_verifier"})]),
         tool_call_response([("task", {"description": "QV again", "prompt": QV_PROMPT_FULL, "subagent_type": "quality_verifier"})]),   # refused
-        tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(tampered)})]),
-        tool_call_response([("bash", {"command": WEAK_CMD})]),      # runs, but the candidate is not QV-bound (weight changed)
-        tool_call_response([("bash", {"command": STRONG_CMD})]),    # runs; acceptance refused (qv_not_bound)
         tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(foreign)})]),
         tool_call_response([("bash", {"command": WEAK_CMD})]),      # refused: foreign question
-        tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(EVAL_INPUT)})]),
-        tool_call_response([("bash", {"command": WEAK_CMD})]),      # real evaluation of the QV-bound candidate
+        tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(tampered)})]),
+        tool_call_response([("bash", {"command": WEAK_CMD})]),      # evaluates changed weights
         tool_call_response([("bash", {"command": WEAK_CMD})]),      # cached (no new run dir)
-        tool_call_response([("bash", {"command": STRONG_CMD})]),    # accepted
+        tool_call_response([("bash", {"command": STRONG_CMD})]),    # accepted, with informational qv_not_bound
         tool_call_response([("bash", {"command": STRONG_CMD})]),    # refused: after acceptance
         tool_call_response([("write", {"filePath": "output/result.json", "content": json.dumps(RESULT_JSON)})]),
         text_response("done"),
@@ -335,10 +340,13 @@ def test_state_machine_blocks_qv_shopping_reevaluation_and_weight_tampering(tmp_
     assert "eval_repeat" in kinds and "eval_after_accept" in kinds, kinds
     assert summary["accepted"] is True and summary["accepted_round"] == 1
     runs = sorted((wd / "eval_attempts").glob("run_*"))
-    # tampered weak + tampered strong + real weak + real strong = 4 evaluator runs; cached/refused calls create none
-    assert len(runs) == 4, [r.name for r in runs]
+    # One weak and one strong evaluation; cached/refused calls create no runs.
+    assert len(runs) == 2, [r.name for r in runs]
     r1 = summary["rounds"][0]
-    assert r1["failure_mode"] == "ACCEPTED" and r1["rubric"][0]["weight"] == 5 and abs(r1["weak_avg"] - 0.15) < 1e-9
+    assert r1["failure_mode"] == "ACCEPTED" and r1["rubric"][0]["weight"] == 10
+    assert r1["weak_avg"] == pytest.approx(11 / 45)
+    assert r1["qv_bound"] is False and "weight of criterion 1" in r1["qv_missing"]
+    assert all(e["informational"] for e in summary["guardrail_events"] if e["kind"] == "qv_not_bound")
     # only one QV subagent transcript exists for the round (the repeat was refused before spawning)
     assert len(list((wd / "trajectory").glob("quality_verifier_*.jsonl"))) == 1
 
@@ -363,3 +371,52 @@ def test_final_qv_repair_reruns_only_the_end_of_loop_verifier(tmp_path: Path):
     assert update["final_accepted"] is True and update["final_qv"]["qv_completed"] is True
     assert len(list((wd / "eval_attempts").glob("run_*"))) == n_runs_before          # no new evaluations
     assert len(list((wd / "trajectory").glob("*qv*.jsonl"))) == n_qv_before + 1       # exactly one new QV transcript
+
+
+@pytest.mark.parametrize('qv_text,completed,final_passed', [
+    (QV_PASS, True, True),
+    (QV_PASS.replace('OVERALL: PASS', 'OVERALL: FAIL'), True, False),
+    ('', False, False),
+])
+def test_real_final_qv_repair_missing_type_resolves_errors_and_preserves_transcripts(
+    tmp_path, qv_text, completed, final_passed,
+):
+    from autodata.cs.pipeline import _agentic_done, _needs_final_qv_repair, previous_summary
+    from tests.fake_openai_server import ScriptedResponder
+
+    candidate = {key: value for key, value in EVAL_INPUT.items() if key != 'question_type'}
+    summary = {'paper_id': 'repair', 'accepted': True, 'accepted_round': 1, 'completed': False,
+               'rounds': [candidate], 'final_qv': {'qv_completed': False},
+               'errors': ['final_qv: outage'], 'resolved_errors': ['older resolved error']}
+    workdir = tmp_path / 'repair'
+    trajectory = workdir / 'trajectory'
+    trajectory.mkdir(parents=True)
+    existing = {'quality_verifier_02.jsonl': 'qv two\n', 'quality_verifier_17.jsonl': 'qv seventeen\n',
+                'final_qv_03.jsonl': 'final three\n', 'final_qv_11.jsonl': 'final eleven\n'}
+    for name, content in existing.items():
+        (trajectory / name).write_text(content)
+    responder = ScriptedResponder([text_response(qv_text)])
+    with FakeServer(responder) as server:
+        cfg = _config(server.base_url, tmp_path)
+        cfg.models['quality_verifier'].max_retries = 0
+        clients = {'quality_verifier': LLMClient(cfg.endpoint('quality_verifier'))}
+        run = PaperRun(cfg, PaperInput('repair', 'Paper', 'Body ' * 200), workdir, clients,
+                       PromptSet(PROMPTS), PROMPTS, log=lambda _: None)
+        update = asyncio.run(run.run_final_qv_only(summary))
+        assert not run.rounds
+    assert update['final_qv']['qv_completed'] is completed
+    assert update['final_accepted'] is final_passed
+    if completed:
+        assert update['errors'] == []
+        assert update['resolved_errors'] == ['older resolved error', 'final_qv: outage']
+    else:
+        assert 'final_qv: outage' in update['errors']
+        assert update['resolved_errors'] == ['older resolved error']
+    assert (trajectory / 'final_qv_18.jsonl').is_file()
+    assert all((trajectory / name).read_text() == content for name, content in existing.items())
+    assert not list((workdir / 'eval_attempts').glob('run_*'))
+    merged = {**summary, **update}
+    (workdir / 'harness_summary.json').write_text(json.dumps(merged))
+    assert _agentic_done(merged) is completed
+    assert _needs_final_qv_repair(cfg, merged) is not completed
+    assert (previous_summary(workdir, 'harness_summary.json', retry_errors=True) is not None) is completed

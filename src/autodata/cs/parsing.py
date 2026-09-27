@@ -107,18 +107,33 @@ REQUIRED_QV_CHECKS = {
 }
 
 
+def _verdict_alternatives(text: str, end: int) -> bool:
+    """An echoed choice on the same line is not a resolved verdict."""
+    tail = text[end:].split("\n", 1)[0]
+    return bool(re.match(r"[ \t*_]*(?:[|/][ \t*_]*|or[ \t*_]+)"
+                         r"(?:PASS|FAIL|NO_LEAKAGE|LEAKAGE|LEAKS_ANSWER|GOOD|BAD|TOO_EASY|RECALL|CONSISTENT|INCONSISTENT)\b",
+                         tail, re.I))
+
+
 def parse_qv_output(text: str) -> dict[str, Any]:
     """Extract CHECK_n verdicts and OVERALL from a quality-verifier message.
 
     `overall` is True only when OVERALL is exactly PASS AND all four checks are present with their passing value
     (NO_LEAKAGE / GOOD / PASS / CONSISTENT); a PASS that contradicts a failing or missing check is False and flagged
-    in `contradiction`. `overall_stated` is what the verifier literally wrote (True/False/None)."""
+    in `contradiction`. `overall_stated` is what the verifier literally wrote (True/False/None).
+    Echoed alternatives such as PASS | FAIL remain unresolved."""
     out: dict[str, Any] = {"overall": None, "overall_stated": None, "checks": {}, "feedback": None,
                            "contradiction": False, "missing_checks": []}
     if not text:
         return out
     for m in _VERDICT_RE.finditer(text):
         key, val = m.group(1), m.group(2).upper()
+        if _verdict_alternatives(text, m.end()):
+            if key == "OVERALL":
+                out["overall_stated"] = None
+            else:
+                out["checks"].pop(key, None)
+            continue
         if key == "OVERALL":
             out["overall_stated"] = True if val == "PASS" else False if val == "FAIL" else None
         else:
@@ -127,9 +142,9 @@ def parse_qv_output(text: str) -> dict[str, Any]:
     if fb:
         out["feedback"] = fb.group(1).strip()[:4000]
     if out["overall_stated"] is None:  # fall back to the last standalone PASS/FAIL token after OVERALL
-        m = re.findall(r"\bOVERALL[^A-Z]*(PASS|FAIL)\b", text.upper())
-        if m:
-            out["overall_stated"] = m[-1] == "PASS"
+        matches = list(re.finditer(r"\bOVERALL[^A-Z]*(PASS|FAIL)\b", text.upper()))
+        if matches and not _verdict_alternatives(text, matches[-1].end()):
+            out["overall_stated"] = matches[-1].group(1) == "PASS"
     out["missing_checks"] = [k for k in REQUIRED_QV_CHECKS if k not in out["checks"]]
     checks_ok = all(out["checks"].get(k) == v for k, v in REQUIRED_QV_CHECKS.items())
     if out["overall_stated"] is True:

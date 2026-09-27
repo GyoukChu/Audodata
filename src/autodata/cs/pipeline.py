@@ -70,8 +70,14 @@ def _cohort_manifest(
         fcntl.flock(stream, fcntl.LOCK_EX)
         if path.exists():
             previous = json.loads(path.read_text(encoding="utf-8"))
+            if corpus_path is None:
+                for key in ("corpus_path", "corpus_sha1"):
+                    current[key] = previous.get(key)
             changed = [key for key in ("config_fingerprint", "prompt_hashes")
                        if previous.get(key) != current[key]]
+            changed.extend(key for key in ("corpus_sha1", "corpus_path")
+                           if previous.get(key) is not None and current[key] is not None
+                           and previous[key] != current[key])
             if changed and not allow_config_mismatch:
                 raise SystemExit(
                     f"Cohort mismatch in {path}: {', '.join(changed)} differ from this run. "
@@ -81,17 +87,69 @@ def _cohort_manifest(
                 def revision(manifest: dict) -> dict:
                     return {key: manifest.get(key) for key in (
                         "config_fingerprint", "prompt_hashes", "created_at", "harness_version",
+                        "corpus_path", "corpus_sha1",
                     )}
-                history = previous.setdefault("history", [revision(previous)])
+                history = previous.setdefault("history", [])
+                old_revision = revision(previous)
+                if not history or any(history[-1].get(key) != old_revision[key] for key in (
+                    "config_fingerprint", "prompt_hashes", "corpus_path", "corpus_sha1",
+                )):
+                    history.append(old_revision)
                 history.append(revision(current))
                 for key in ("config_fingerprint", "prompt_hashes", "harness_version"):
                     previous[key] = current[key]
+            added = [pid for pid in current["paper_ids"] if pid not in previous.get("paper_ids", [])]
+            if added:
+                print(f"cohort: extending by {len(added)} paper ids: {', '.join(added)}", flush=True)
             previous["paper_ids"] = list(dict.fromkeys(previous.get("paper_ids", []) + current["paper_ids"]))
-            if previous.get("corpus_path") is None and corpus_path is not None:
+            if corpus_path is not None:
                 previous.update(corpus_path=current["corpus_path"], corpus_sha1=corpus_sha1)
             current = previous
         _atomic_write_json(path, current)
     return current
+
+
+def _record_cohort_import(root: Path, paper_id: str, summary: dict) -> None:
+    """Register an imported candidate once, without losing concurrent cohort updates."""
+    fingerprint = summary.get("config_fingerprint")
+    if fingerprint is None:
+        return
+    with (root / ".cohort.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        path = root / "cohort.json"
+        cohort = json.loads(path.read_text(encoding="utf-8"))
+        known = {cohort.get("config_fingerprint"),
+                 *(entry.get("config_fingerprint") for entry in cohort.get("history", []))}
+        if fingerprint in known:
+            return
+        imports = cohort.setdefault("imports", [])
+        entry = next((entry for entry in imports if entry.get("config_fingerprint") == fingerprint), None)
+        if entry is None:
+            entry = {"config_fingerprint": fingerprint, "harness_version": summary.get("harness_version"),
+                     "paper_ids": []}
+            if "prompt_hashes_sha1" in summary:
+                entry["prompt_hashes_sha1"] = summary["prompt_hashes_sha1"]
+            imports.append(entry)
+        changed = False
+        if "prompt_hashes_sha1" not in entry and "prompt_hashes_sha1" in summary:
+            entry["prompt_hashes_sha1"] = summary["prompt_hashes_sha1"]
+            changed = True
+        if paper_id not in entry["paper_ids"]:
+            entry["paper_ids"].append(paper_id)
+            changed = True
+        if changed:
+            _atomic_write_json(path, cohort)
+
+
+def _paper_text_changed(cfg: AppConfig, paper: PaperInput, workdir: Path) -> bool:
+    path = workdir / "paper.txt"
+    if not path.exists():
+        return False
+    # Match prepare_workspace's rendering, including its truncation marker.
+    text = paper.text
+    if len(text) > cfg.run.paper_text_max_chars:
+        text = text[:cfg.run.paper_text_max_chars] + "\n\n[paper text truncated by the harness]\n"
+    return hashlib.sha1(path.read_bytes()).digest() != hashlib.sha1(text.encode("utf-8")).digest()
 
 
 async def wait_for_endpoints(
@@ -147,6 +205,9 @@ def _needs_final_qv_repair(cfg: AppConfig, summary: dict) -> bool:
 
 
 def _agentic_done(summary: dict) -> bool:
+    final_qv = summary.get("final_qv")
+    if summary.get("accepted") and isinstance(final_qv, dict) and final_qv.get("qv_completed") is True:
+        return True
     return bool(summary.get("completed") and not summary.get("errors")
                 and summary.get("agent_stop_reason") not in ("error", "crashed"))
 
@@ -234,6 +295,7 @@ async def run_papers(
     run_one: Callable[..., Awaitable[dict]],
     roles: tuple[str, ...], prompts_dir: Path | None = None,
     allow_config_mismatch: bool = False, corpus_path: Path | None = None, health_wait_s: float = 1800,
+    needs_repair: Callable[[AppConfig, dict], bool] | None = None,
 ) -> list[dict]:
     """Run either paper workflow with shared locking, resume, archives and bookkeeping."""
     if concurrency < 1:
@@ -264,6 +326,26 @@ async def run_papers(
     async def one(p: PaperInput) -> dict:
         workdir = root / p.paper_id
         started = time.time()
+        repair = False
+        prev = None
+
+        def stamp(summary: dict) -> dict:
+            if not repair:
+                return {**summary, **stamps}
+            summary = dict(summary)
+            for key in stamps:
+                summary.pop(key, None)
+                if key in prev:
+                    summary[key] = prev[key]
+            return {**summary, "repair_config_fingerprint": stamps["config_fingerprint"],
+                    "repair_prompt_hashes_sha1": stamps["prompt_hashes_sha1"],
+                    "repaired_at": datetime.now(timezone.utc).isoformat()}
+
+        def repair_failed(exc: Exception) -> dict:
+            prefix = "final_qv" if summary_filename == "harness_summary.json" else "repair"
+            log(f"[{p.paper_id}] {prefix} repair failed: {type(exc).__name__}: {exc}")
+            return {**prev, "final_accepted": False,
+                    "errors": [*(prev.get("errors") or []), f"{prefix}: {type(exc).__name__}: {exc}"]}
 
         def failed(exc: Exception) -> dict:
             error = f"{type(exc).__name__}: {exc}"
@@ -279,45 +361,56 @@ async def run_papers(
         async with sem:
             plock = PaperLock(workdir)
             try:
-                if not plock.acquire():
+                if (root / "DRAIN").exists():
+                    # Operator drain: in-flight papers finish, queued papers are not started (no workspace, no lock).
+                    log(f"[{p.paper_id}] skipped: drain requested (DRAIN file present)")
+                    s = {"paper_id": p.paper_id, "title": p.title, "skipped": "drained",
+                         "accepted": False, "completed": False,
+                         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                elif not plock.acquire():
                     log(f"[{p.paper_id}] skipped: workspace is locked by another runner")
                     s = {"paper_id": p.paper_id, "title": p.title, "skipped": "locked",
                          "accepted": False, "completed": False,
                          "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 else:
                     try:
-                        repair = False
-                        prev = None
                         if resume:
                             prev = previous_summary(workdir, summary_filename, retry_errors=False, is_done=is_done)
-                            repair = (summary_filename == "harness_summary.json" and prev is not None
-                                      and _needs_final_qv_repair(cfg, prev))
-                            if prev is not None and retry_errors and not repair and not is_done(prev):
+                            if prev is not None and _paper_text_changed(cfg, p, workdir):
+                                log(f"[{p.paper_id}] resume: paper text changed, rerunning")
                                 prev = None
                             if prev is not None:
                                 if prev.get("config_fingerprint") not in (None, fingerprint):
                                     log(f"[{p.paper_id}] resume: WARNING previous run used a different config "
                                         f"({prev.get('config_fingerprint')})")
+                                _record_cohort_import(root, p.paper_id, prev)
+                                hook = needs_repair or (_needs_final_qv_repair
+                                                        if summary_filename == "harness_summary.json" else None)
+                                repair = hook is not None and hook(cfg, prev)
+                            if prev is not None and retry_errors and not repair and not is_done(prev):
+                                prev = None
+                            if prev is not None:
                                 if not repair:
                                     log(f"[{p.paper_id}] resume: already done (accepted={prev.get('accepted')})")
                                     return prev
-                                log(f"[{p.paper_id}] resume: repairing final QV only")
+                                label = "final QV only" if summary_filename == "harness_summary.json" else "frozen candidate"
+                                log(f"[{p.paper_id}] resume: repairing {label}")
                         await wait_for_endpoints(cfg, roles, lambda msg: log(f"[{p.paper_id}] {msg}"),
                                                  health_wait_s=health_wait_s)
                         if not repair:
                             archive_workdir(workdir, root=root)
                         try:
-                            update = await run_one(p, workdir, clients, prompts, prompts_dir, log,
-                                                   **({"repair_final_qv": True} if repair else {}))
+                            repair_kwargs = {"repair": True, "prev": prev} if repair else {}
+                            if repair and summary_filename == "harness_summary.json":
+                                repair_kwargs["repair_final_qv"] = True
+                            update = await run_one(p, workdir, clients, prompts, prompts_dir, log, **repair_kwargs)
                             s = {**prev, **update} if repair else update
                         except Exception as exc:
                             if repair:
-                                log(f"[{p.paper_id}] final QV repair failed: {type(exc).__name__}: {exc}")
-                                s = {**prev, "final_accepted": False,
-                                     "errors": [*(prev.get("errors") or []), f"final_qv: {type(exc).__name__}: {exc}"]}
+                                s = repair_failed(exc)
                             else:
                                 s = failed(exc)
-                        s = {**s, **stamps}
+                        s = stamp(s)
                         try:
                             _atomic_write_json(workdir / summary_filename, s)
                         except Exception as write_exc:
@@ -326,9 +419,10 @@ async def run_papers(
                         plock.release()
             except Exception as exc:
                 # Filesystem/constructor failures are per-paper failures too.
-                s = failed(exc)
+                s = stamp(repair_failed(exc) if repair else failed(exc))
         async with lock:
-            s = {**s, **stamps}
+            if not repair:
+                s = {**s, **stamps}
             with open(summary_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(s, ensure_ascii=False) + "\n")
             done["n"] += 1
@@ -348,11 +442,11 @@ async def run_corpus(cfg: AppConfig, papers: list[PaperInput], workdir_root: Pat
                      resume: bool = True, prompts_dir: Path | None = None, retry_errors: bool = True,
                      allow_config_mismatch: bool = False, corpus_path: Path | None = None,
                      health_wait_s: float = 1800) -> list[dict]:
-    async def run_one(paper, workdir, clients, prompts, prompts_dir_abs, log, *, repair_final_qv=False):
+    async def run_one(paper, workdir, clients, prompts, prompts_dir_abs, log, *,
+                      repair_final_qv=False, repair=False, prev=None):
         runner = PaperRun(cfg, paper, workdir, clients, prompts, prompts_dir_abs, log=log)
         if repair_final_qv:
-            summary = json.loads((workdir / "harness_summary.json").read_text(encoding="utf-8"))
-            return await runner.run_final_qv_only(summary)
+            return await runner.run_final_qv_only(prev)
         return await runner.run()
 
     return await run_papers(cfg, papers, workdir_root, concurrency=concurrency, resume=resume,
@@ -374,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-resume", action="store_true", help="archive existing per-paper workspaces and start fresh")
     ap.add_argument("--keep-errors", action="store_true", help="on resume, do not rerun papers that ended in error")
     ap.add_argument("--prompts-dir")
-    ap.add_argument("--allow-config-mismatch", action="store_true", help="record changed config/prompts in cohort history")
+    ap.add_argument("--allow-config-mismatch", action="store_true", help="record changed config/prompts/corpus in cohort history")
     ap.add_argument("--health-wait-s", type=float, default=1800, help="endpoint readiness deadline per paper (seconds)")
     args = ap.parse_args(argv)
 

@@ -19,13 +19,14 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 from autodata.config import AcceptancePreset, AppConfig
-from autodata.cs.evaluate_rubric import compute_question_hash
+from autodata.cs.evaluate_rubric import compute_question_hash, legacy_question_hash
 from autodata.cs.parsing import parse_challenger_output, parse_qv_output
 from autodata.cs.rubric import parse_rubric, score_response
 from autodata.cs.prompts import PromptSet
@@ -101,6 +102,22 @@ def _norm(s: str | None) -> str:
 
 def _alnum(s: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _decode_json_escapes(s: str) -> str:
+    """Decode JSON escapes in quoted prompt text without reinterpreting Unicode."""
+    return re.sub(r'(?:\\u[0-9a-fA-F]{4}){1,2}|\\["\\/bfnrt]',
+                  lambda match: json.loads('"' + match[0] + '"'), s)
+
+
+def _bind_norm(s: str | None, *, prompt: bool = False) -> str:
+    text = _decode_json_escapes(s or "") if prompt else (s or "")
+    text = unicodedata.normalize("NFC", text).lower()
+    return re.sub(r"[^a-z0-9-]+", " ", text).strip()
+
+
+def _text_norm(s: str | None) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", s or "").replace("\r\n", "\n")).strip()
 
 
 def canonical_rel(path: str) -> str | None:
@@ -188,6 +205,7 @@ async def run_evaluator(workdir: Path, argv_abs: list[str], *, deadline_s: float
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     env["PYTHONUNBUFFERED"] = "1"
+    env["AUTODATA_PARENT_PID"] = str(os.getpid())
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -218,21 +236,22 @@ def evaluator_deadline_s(cfg: AppConfig, mode: str, solver_timeout_s: float) -> 
 
 
 def final_filter(cfg: AppConfig, context: str, rubric: Any) -> dict:
-    """Programmatic final checks shared by the agentic and CoT pipelines (Sec. 3.1)."""
+    """Final context/rubric shape checks; Fig. 8 weight ranges are informational."""
     context = context or ""
     out: dict = {"context_chars": len(context), "n_rubric_items": len(rubric) if isinstance(rubric, list) else None,
-                 "context_ok": len(context) >= cfg.run.final_min_context_chars, "rubric_ok": False, "rubric_error": None}
+                 "context_ok": len(context) >= cfg.run.final_min_context_chars, "rubric_ok": False, "rubric_error": None,
+                 "weights_in_spec": False}
     try:
         items = parse_rubric(rubric)
         n_pos = sum(1 for it in items if it.weight > 0)
         n_neg = sum(1 for it in items if it.weight < 0)
         weights_ok = all(1 <= abs(it.weight) <= 10 for it in items)  # challenger spec (Fig. 8): +1..+10 / -1..-10
         # Defaults also support RunConfig versions predating these shape knobs.
-        ok = weights_ok and (getattr(cfg.run, "final_rubric_min_items", 10) <= len(items)
+        ok = (getattr(cfg.run, "final_rubric_min_items", 10) <= len(items)
               <= getattr(cfg.run, "final_rubric_max_items", 20)
               and n_pos >= getattr(cfg.run, "final_rubric_min_positive", 4)
               and n_neg >= getattr(cfg.run, "final_rubric_min_negative", 3))
-        out.update({"n_positive": n_pos, "n_negative": n_neg, "rubric_ok": ok})
+        out.update({"n_positive": n_pos, "n_negative": n_neg, "rubric_ok": ok, "weights_in_spec": weights_ok})
     except Exception as e:
         out["rubric_error"] = repr(e)
     return out
@@ -374,9 +393,11 @@ class PaperRun:
             self.log(f"[{self.paper.paper_id}] round {rec.index}: challenger")
         if subagent_type == "quality_verifier" and self.rounds:
             rec0 = self.rounds[-1]
-            q_alnum = _alnum((rec0.challenger_json or {}).get("question"))
+            candidate = rec0.last_candidate() or rec0.challenger_json or {}
+            question = _bind_norm(candidate.get("question"))
             for prev in rec0.qv_calls:
-                if prev.get("stop_reason") == "final" and q_alnum and q_alnum in prev.get("prompt_alnum", "") and q_alnum in _alnum(prompt):
+                if (prev.get("stop_reason") == "final" and question
+                        and question in _bind_norm(prev.get("prompt", ""), prompt=True)):
                     verdict = "PASS" if prev["parsed"].get("overall") else "FAIL"
                     self._guard("qv_repeat", f"repeated QV on the same question refused (previous verdict {verdict})")
                     return (f"Quality verification for this question was already completed in this round with OVERALL: {verdict}. "
@@ -464,8 +485,10 @@ class PaperRun:
     def _verify_report(self, report: dict[str, Any], candidate: dict[str, Any], input_sha1: str, rc: int | None,
                        report_path: Path, new_dirs: set[Path], *, mode: str = "both",
                        rec: RoundRecord | None = None) -> tuple[dict[str, Any], list[str]]:
-        """Provenance + independent recomputation. Returns (harness_verdict, problems)."""
+        """Return (verdict, blocking problems); verdict warnings are informational."""
         problems: list[str] = []
+        warnings: list[str] = []
+        question_hashes = {compute_question_hash(candidate), legacy_question_hash(candidate)}
         expected_models = {role: self.cfg.endpoint(role).model for role in ("weak_solver", "strong_solver", "judge")}
         models = report.get("models") or {}
         for role, name in expected_models.items():
@@ -477,10 +500,10 @@ class PaperRun:
             problems.append("evaluator config differs from the harness-written api_config.json")
         if mode == "strong-only":
             src = report.get("weak_source_report")
-            qh = report.get("question_hash")
             verified_weak = []
             for ev in (rec.evals if rec is not None else []):
-                if ev.get("mode") == "weak-only" and ev.get("verified") and ev.get("question_hash") == qh and ev.get("report_path"):
+                if (ev.get("verified") and ev.get("question_hash") in question_hashes
+                        and (ev.get("report") or {}).get("weak_attempts") and ev.get("report_path")):
                     verified_weak.append(Path(ev["report_path"]).resolve())
             if not src or Path(src).resolve() not in verified_weak:
                 problems.append("weak result provenance: strong-only report does not reuse a weak run verified in this round")
@@ -496,7 +519,7 @@ class PaperRun:
             problems.append(f"evaluator exit code {rc}")
         if report.get("error"):
             problems.append(f"evaluator error: {report['error']}")
-        if report.get("question_hash") != compute_question_hash(candidate):
+        if report.get("question_hash") not in question_hashes:
             problems.append("question_hash mismatch")
         if report.get("input_sha1") not in (None, input_sha1):
             problems.append("input_sha1 mismatch")
@@ -508,7 +531,7 @@ class PaperRun:
         if (report.get("eval") or {}).get("n_attempts") != n_req:
             problems.append("n_attempts in report differs from the run config")
         if not self.rubric_weights_in_bounds(candidate.get("rubric")):
-            problems.append("rubric weights outside the challenger spec (|weight| must be 1..10)")
+            warnings.append("rubric weights outside the challenger spec (|weight| must be 1..10)")
         verdict: dict[str, Any] = harness_predicate(self.cfg.acceptance, None, None)
         try:
             items = parse_rubric(candidate.get("rubric"))
@@ -525,39 +548,51 @@ class PaperRun:
                     problems.append(f"verdict mismatch on {k}: evaluator={report.get(k)} harness={verdict.get(k)}")
         except Exception as e:
             problems.append(f"recomputation failed: {e!r}")
+        verdict["warnings"] = warnings
         return verdict, problems
 
     def _qv_bound(self, rec: RoundRecord, candidate: dict[str, Any]) -> bool:
-        """The round's (last) QV call must have reviewed THIS candidate: the question, the head of the context and every
-        rubric criterion WITH ITS WEIGHT must appear in the QV prompt (compared on alphanumerics only, so JSON escaping
-        does not matter; the weight must sit within 40 characters of its criterion, as in a JSON item or a bullet)."""
-        if not rec.qv_calls:
-            return False
-        prompt = _alnum(rec.qv_calls[-1]["prompt"])
-        q = _alnum(candidate.get("question"))
-        if not q or q not in prompt:
-            return False
-        ctx = _alnum(candidate.get("context"))[:200]
-        if ctx and ctx not in prompt:
-            return False
-        for item in candidate.get("rubric") or []:
+        """Bind the last QV to quoted criteria (or 80-character prefixes) and signed weights."""
+        return bool(rec.qv_calls) and not self._qv_missing(rec.qv_calls[-1]["prompt"], candidate)
+
+    @staticmethod
+    def _qv_missing(prompt: str, candidate: dict[str, Any]) -> list[str]:
+        decoded = _decode_json_escapes(prompt)
+        prompt = _bind_norm(decoded)
+        missing = []
+        question = _text_norm(candidate.get("question"))
+        if (not question or (question not in _text_norm(decoded)
+                             and _bind_norm(candidate.get("question")) not in prompt)):
+            missing.append("question")
+        context = _bind_norm(candidate.get("context"))[:200]
+        if context and context not in prompt:
+            missing.append("context head")
+        for index, item in enumerate(candidate.get("rubric") or [], 1):
             if not isinstance(item, dict):
-                return False
-            crit = _alnum(item.get("criterion"))[:80]
-            if not crit:
-                return False
-            pos = prompt.find(crit)
-            if pos < 0:
-                return False
-            weight = str(abs(int(item.get("weight", 0)))) if str(item.get("weight", "")).lstrip("+-").isdigit() else ""
-            window = prompt[max(0, pos - 40):pos] + prompt[pos + len(crit):pos + len(crit) + 40]
-            if not weight or weight not in window:
-                return False
-        return True
+                missing.append(f"criterion {index}")
+                continue
+            criterion = _bind_norm(item.get("criterion"))
+            if criterion not in prompt:
+                criterion = criterion[:80]
+            if not criterion or criterion not in prompt:
+                missing.append(f"criterion {index}")
+                continue
+            try:
+                weight = str(int(item.get("weight")))
+            except (TypeError, ValueError):
+                missing.append(f"weight of criterion {index}")
+                continue
+            token = re.compile(r"(?<![0-9-])" + re.escape(weight) + r"(?![0-9])")
+            positions = [m.start() for m in re.finditer(r"(?=" + re.escape(criterion) + r")", prompt)]
+            if not any(max(0, pos - 60) <= m.start() and m.end() <= pos
+                       or pos + len(criterion) <= m.start() and m.end() <= pos + len(criterion) + 60
+                       for pos in positions for m in token.finditer(prompt)):
+                missing.append(f"weight of criterion {index}")
+        return missing
 
     @staticmethod
     def rubric_weights_in_bounds(rubric: Any, lo: int = 1, hi: int = 10) -> bool:
-        """Challenger spec (Fig. 8): positive weights +1..+10, negative weights -1..-10."""
+        """Informational Fig. 8 range check; out-of-range integer weights still score."""
         if not isinstance(rubric, list) or not rubric:
             return False
         for item in rubric:
@@ -590,26 +625,43 @@ class PaperRun:
             rec.evals.append({"mode": mode, "argv": argv, "stdout": f"INPUT_ERROR: {e}", "report": None,
                               "candidate": None, "input_sha1": input_sha1, "returncode": None, "elapsed_s": 0.0})
             return f"INPUT_ERROR: eval_input.json is not valid JSON ({e}). Rewrite it with the write tool."
-        qh = compute_question_hash(candidate)
+        try:
+            qh = compute_question_hash(candidate)
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            # RubricError inherits ValueError, so invalid rubrics are input errors too.
+            self._guard("bad_eval_input", repr(exc))
+            return f"INPUT_ERROR: invalid question or rubric ({exc}). Rewrite eval_input.json with the write tool."
         if self.accepted_round_idx is not None:
             self._guard("eval_after_accept", "evaluation refused after acceptance")
             return (f"A question was already ACCEPTED in round {self.accepted_round_idx}. No further evaluations: write the final "
                     "output/result.json (with final_accepted_round set) and stop.")
         # the evaluated question must be the challenger's question for this round (the main agent never writes questions)
         cj = rec.challenger_json or {}
-        cand_q = _alnum(candidate.get("question"))
+        cand_q = _text_norm(candidate.get("question"))
         origin_ok = bool(cand_q) and (
-            (cj.get("question") and _alnum(cj.get("question")) == cand_q) or
-            (not cj.get("question") and cand_q in _alnum(rec.challenger_output)))
+            (cj.get("question") and _text_norm(cj.get("question")) == cand_q) or
+            (not cj.get("question") and cand_q in _text_norm(rec.challenger_output)))
         if not origin_ok:
             self._guard("eval_foreign_candidate", "evaluation refused: the question is not this round's challenger output")
             return ("Error: the question in eval_input.json is not the challenger's question for this round. Only the "
                     "challenger writes questions: call the challenger (a new round) and evaluate its output unchanged.")
-        for prev in reversed(rec.evals):
-            if prev.get("question_hash") == qh and prev.get("mode") == mode and prev.get("verified"):
-                self._guard("eval_repeat", f"repeated {mode} evaluation of the same question served from cache")
-                return prev["stdout"] + "\n[cached: this question was already evaluated in this mode in this round; a completed " \
-                                        "result is final - to change the outcome, ask the challenger for an ENTIRELY NEW question]"
+        prior = [ev for ev in reversed(rec.evals) if ev.get("verified") and ev.get("question_hash") == qh]
+        weak_ev = next((ev for ev in prior if (ev.get("report") or {}).get("weak_attempts")), None)
+        strong_ev = next((ev for ev in prior if (ev.get("report") or {}).get("strong_attempts")), None)
+        cached = weak_ev if mode == "weak-only" else strong_ev
+        continuation = ""
+        if mode == "both" and cached is None and weak_ev is not None:
+            if weak_ev["verdict"].get("weak_passed"):
+                mode = "strong-only"
+                argv_abs.append("--strong-only")
+                continuation = "\n[cached weak stage passed; executed --strong-only using the verified weak result]"
+            else:
+                cached = weak_ev
+        if cached is not None:
+            self._guard("eval_repeat", f"repeated {mode} evaluation of the same question served from cache")
+            self._accept_evaluation(rec, cached)
+            return cached["stdout"] + "\n[cached: this question was already evaluated in this round; a completed " \
+                                      "result is final - to change the outcome, ask the challenger for an ENTIRELY NEW question]"
         eval_dir = (self.workdir / EVAL_DIR_REL).resolve()
         before = {p.resolve() for p in eval_dir.glob("run_*")}
         deadline = evaluator_deadline_s(self.cfg, mode, float(opts["timeout_s"]))
@@ -641,34 +693,48 @@ class PaperRun:
         entry: dict[str, Any] = {"mode": mode, "argv": argv, "stdout": stdout[-20000:], "stderr_tail": stderr[-2000:],
                                  "report": report, "report_path": str(report_path) if report_path else None,
                                  "candidate": candidate, "input_sha1": input_sha1, "question_hash": compute_question_hash(candidate),
-                                 "elapsed_s": time.time() - t0, "returncode": rc, "verified": False, "problems": [], "verdict": None}
+                                 "elapsed_s": time.time() - t0, "returncode": rc, "verified": False,
+                                 "problems": [], "warnings": [], "verdict": None}
         rec.evals.append(entry)
         if report and report_path:
             verdict, problems = self._verify_report(report, candidate, input_sha1, rc, report_path, new_dirs, mode=mode, rec=rec)
             entry["verdict"] = verdict
             entry["problems"] = problems
+            entry["warnings"] = verdict.get("warnings", [])
             entry["verified"] = not problems
+            if entry["warnings"]:
+                self._guard("rubric_weights_out_of_spec", "; ".join(entry["warnings"]), informational=True)
             self.log(f"[{self.paper.paper_id}] round {rec.index}: eval {mode} -> weak_avg={verdict.get('weak_avg')} "
                      f"strong_avg={verdict.get('strong_avg')} gap={verdict.get('gap')} all_passed={verdict.get('all_passed')}"
                      + (f" PROBLEMS={problems}" if problems else ""))
             if problems:
                 self._guard("unverified_report", "; ".join(problems), mode=mode)
-            if verdict.get("all_passed") and not problems and self.accepted_round_idx is None:
-                if not rec.qv_passed:
-                    self._guard("accept_without_qv", "solver criteria passed but the round has no passing QV; not accepted")
-                elif not self._qv_bound(rec, candidate):
-                    self._guard("qv_not_bound", "solver criteria passed but the QV call did not review this question; not accepted")
-                else:
-                    self.accepted_round_idx = rec.index
-                    ref = None
-                    cj = rec.challenger_json or {}
-                    if _norm(cj.get("question"))[:120] == _norm(candidate.get("question"))[:120]:
-                        ref = cj.get("reference_answer")
-                    self.accepted = {"round": rec.index, "candidate": candidate, "reference_answer": ref,
-                                     "verdict": verdict, "report_path": str(report_path), "input_sha1": input_sha1,
-                                     "question_hash": entry["question_hash"], "qv": rec.qv_calls[-1]["parsed"]}
-                    self.log(f"[{self.paper.paper_id}] round {rec.index}: ACCEPTED (harness-verified)")
-        return stdout
+            self._accept_evaluation(rec, entry)
+        return stdout + continuation
+
+    def _accept_evaluation(self, rec: RoundRecord, entry: dict[str, Any]) -> None:
+        """Accept a verified result with passing QV; prompt binding is informational.
+
+        The end-of-loop verifier reviews the exact frozen candidate.
+        """
+        verdict = entry.get("verdict") or {}
+        candidate = entry["candidate"]
+        if not verdict.get("all_passed") or not entry.get("verified") or self.accepted_round_idx is not None:
+            return
+        if not rec.qv_passed:
+            self._guard("accept_without_qv", "solver criteria passed but the round has no passing QV; not accepted")
+        else:
+            missing = self._qv_missing(rec.qv_calls[-1]["prompt"], candidate)
+            if missing:
+                self._guard("qv_not_bound", "QV prompt missing " + "; ".join(missing), informational=True)
+            self.accepted_round_idx = rec.index
+            cj = rec.challenger_json or {}
+            ref = cj.get("reference_answer") if _text_norm(cj.get("question")) == _text_norm(candidate.get("question")) else None
+            self.accepted = {"round": rec.index, "candidate": candidate, "reference_answer": ref,
+                             "verdict": verdict, "report_path": entry["report_path"], "input_sha1": entry["input_sha1"],
+                             "question_hash": entry["question_hash"], "qv": rec.qv_calls[-1]["parsed"],
+                             "qv_bound": not missing, "qv_missing": missing}
+            self.log(f"[{self.paper.paper_id}] round {rec.index}: ACCEPTED (harness-verified)")
 
     def _on_event(self, ev: AgentEvent) -> None:  # hook for the main agent (kept light; transcripts hold the details)
         pass
@@ -681,7 +747,9 @@ class PaperRun:
         context = cand.get("context") or ""
         question = cand.get("question") or ""
         rubric = cand.get("rubric") or []
-        qtype = str(cand.get("question_type") or (self.rounds[self.accepted["round"] - 1].challenger_json or {}).get("question_type") or "")
+        index = self.accepted["round"] - 1
+        round_candidate = (self.rounds[index].challenger_json or {}) if 0 <= index < len(self.rounds) else {}
+        qtype = str(cand.get("question_type") or self.accepted.get("question_type") or round_candidate.get("question_type") or "")
         programmatic = final_filter(self.cfg, context, rubric)
         prompt = self.prompts.qv_request(qtype, context, question, json.dumps(rubric, ensure_ascii=False, indent=1))
         self.subagent_counter["quality_verifier"] += 1
@@ -711,16 +779,24 @@ class PaperRun:
             raise ValueError("summary has no accepted round to repair")
         rd = rounds[idx - 1]
         self.ws = prepare_workspace(self.cfg, self.paper, self.workdir, self.prompts_dir_abs)
-        self.subagent_counter["quality_verifier"] = sum(1 for _ in (self.workdir / "trajectory").glob("*qv*.jsonl")) + 1
+        suffixes = [int(match[1]) for path in (self.workdir / "trajectory").glob("*.jsonl")
+                    if (match := re.fullmatch(r"(?:quality_verifier|final_qv)_(\d+)\.jsonl", path.name))]
+        # run_final_qv increments the counter before allocating its transcript.
+        self.subagent_counter["quality_verifier"] = max(suffixes, default=0)
         candidate = {k: rd.get(k) for k in ("question_type", "context", "question", "rubric")}
         self.accepted_round_idx = idx
-        self.accepted = {"round": idx, "candidate": candidate, "reference_answer": rd.get("reference_answer"),
+        self.accepted = {"round": idx, "candidate": candidate, "question_type": rd.get("question_type"),
+                         "reference_answer": rd.get("reference_answer"),
                          "verdict": {k: rd.get(k) for k in ("weak_avg", "strong_avg", "gap", "weak_passed", "strong_passed",
                                                              "gap_passed", "weak_scores", "strong_scores")} | {"all_passed": True}}
         final_qv = await self.run_final_qv()
         errors = list(summary.get("errors") or []) + self.errors
+        resolved = list(summary.get("resolved_errors") or [])
+        if final_qv and final_qv.get("qv_completed"):
+            resolved.extend(error for error in errors if error.startswith("final_qv:"))
+            errors = [error for error in errors if not error.startswith("final_qv:")]
         return {"final_qv": final_qv, "final_accepted": bool(final_qv and final_qv.get("passed")),
-                "final_qv_repaired_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errors,
+                "final_qv_repaired_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "errors": errors, "resolved_errors": resolved,
                 "wall_time_s": round(float(summary.get("wall_time_s") or 0) + time.time() - t0, 1)}
 
     # ------------------------------------------------------------------ summary
@@ -748,6 +824,8 @@ class PaperRun:
         question = cand.get("question") or cj.get("question")
         context = cand.get("context") or cj.get("context")
         rubric = cand.get("rubric") or cj.get("rubric")
+        qv_missing = self._qv_missing(rec.qv_calls[-1]["prompt"] if rec.qv_calls else "",
+                                      {"question": question, "context": context, "rubric": rubric})
         if rec.index == self.accepted_round_idx:
             mode = "ACCEPTED"
         elif rec.qv_passed is False:
@@ -764,11 +842,14 @@ class PaperRun:
             "index": rec.index,
             "failure_mode": mode,
             "qv_passed": rec.qv_passed,
+            "qv_bound": bool(rec.qv_calls) and not qv_missing,
+            "qv_missing": qv_missing,
             "qv_contradiction": bool(rec.qv_calls and rec.qv_calls[-1]["parsed"].get("contradiction")),
             "n_qv_calls": len(rec.qv_calls),
             "n_eval_calls": len(rec.evals),
             "eval_verified": bool((strong_ev or weak_ev or {}).get("verified")),
             "eval_problems": ((strong_ev or weak_ev or {}).get("problems") or []),
+            "eval_warnings": ((strong_ev or weak_ev or {}).get("warnings") or []),
             "weak_avg": weak.get("weak_avg"),
             "weak_scores": weak.get("weak_scores"),
             "strong_avg": strong.get("strong_avg"),

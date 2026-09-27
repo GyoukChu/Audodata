@@ -52,10 +52,56 @@ The pipeline also polls every endpoint it uses before each paper, every 15 secon
 path and SHA-1 when supplied, requested paper IDs, creation time, and harness version. Later selections extend the paper
 list, so resuming a subset does not remove pending papers from the cohort. Both workflows stamp newly written summaries
 with `config_fingerprint` and `prompt_hashes_sha1`. Programmatic callers can supply `corpus_path` to the shared driver;
-the agentic CLI supplies it from `--corpus`.
+both CLIs supply it from `--corpus`.
 
-Changed configs or prompts require a fresh run root or an explicit `autodata-run-cs --allow-config-mismatch` override.
+Changed configs, prompts, corpus SHA-1, or known corpus paths require a fresh run root or an explicit
+`--allow-config-mismatch` override (available on both workflows).
 The override records the old and new provenance in `cohort.json` history; the shared `run_papers` API accepts
 `allow_config_mismatch=True` too. Completed papers stay skipped. Accepted papers with unfinished final QV resume only
 that verification, retaining their workspace and solver results. Statistics print requested, completed, incomplete,
 and pending counts and both acceptance rates: completed papers and the entire requested cohort.
+
+On resume, each existing `paper.txt` is compared with the current corpus text as the workspace would render it,
+including truncation. A difference logs `resume: paper text changed, rerunning`, archives the workspace, and starts a
+fresh attempt. Imported summary fingerprints absent from both the current cohort and its history are recorded once in
+`cohort.json["imports"]`, with harness version, available prompt fingerprint, and accumulating paper IDs.
+
+The CoT baseline repairs a frozen candidate when its summary's question, context, and rubric match `eval_input.json`.
+It keeps the workspace and skips the challenger, rerunning only an incomplete quality verifier, a missing/errored weak
+report (`--weak-only`), or a missing/errored strong report (`--strong-only --force-strong`). The evaluator can reuse the
+earlier weak run for that question hash. The summary lists attempted stages in `repaired`; incomplete QV is an error,
+and completion still requires no errors and both averages. A mismatched candidate requires a fresh attempt. Both repair
+paths preserve original `config_fingerprint` and `prompt_hashes_sha1`, recording current values separately in
+`repair_config_fingerprint`, `repair_prompt_hashes_sha1`, and `repaired_at`, including failed repairs. An accepted agentic
+candidate with completed final QV stays terminal even if its old agent stop reason or historical errors remain.
+
+Corpus building validates every existing record against the active year, field, abstract/body length, release, and
+shard filters before counting it toward completion. Build parameters are stored in `<output>.meta.json`; filter or
+release/shard recipe changes are refused on resume. Increasing `--n-papers` with the same recipe is supported.
+`autodata-build-corpus --allow-filter-mismatch` logs mismatches and keeps existing records, recording earlier parameters
+in the metadata history. It does not refilter or discard them.
+
+Draining a runner: create an empty `DRAIN` file in the run root (`touch runs/pilot/DRAIN`). Papers already in flight
+finish normally; papers not yet started are skipped with `skipped: drained` (recorded only in `summary.jsonl`, never as
+a per-paper summary) and the runner exits when the in-flight papers are done. Delete the file before the next launch.
+Use this before restarting a runner under new code so that no in-flight work is lost.
+
+Retiring a runner that predates the DRAIN file (one-off, used for the round-4 upgrade of the pilot):
+`python scripts/hold_paper_locks.py --root runs/pilot --root runs/pilot_cot` holds the lock of every queued paper, so the
+old runner finishes its in-flight papers and skips the rest ("skipped: workspace is locked") at its next free slot.
+After that skip burst appears in the old runner's log, `touch runs/.release_locks` releases the locks and new runners
+can start on the same roots. Never release before the burst: the old runner would pick up queued papers again.
+
+Re-adjudication after withdrawn checks: `python scripts/readjudicate_refused.py --config configs/cs_pilot.yaml
+--root runs/pilot [--dry-run]` rewrites (with a backup) the summaries of papers whose acceptance was refused only by
+checks withdrawn in round 4 (blocking in-loop QV binding; version-skew hash/provenance problems; weight range), after an
+exact recomputation from the recorded judgments. The next resume runs the end-of-loop quality verifier on the frozen
+candidate. Papers held by a runner are skipped.
+
+Upgrading code under a running pipeline: the evaluator runs as a fresh subprocess and imports the CURRENT working tree,
+while runner processes keep the code they started with. Any change to the evaluator report format must stay readable by
+the running harness (e.g. `question_hash` keeps the legacy identity; the canonical identity is `question_hash_canonical`).
+
+The Semantic Scholar limiter enforces a 3.0-second minimum between requests across all endpoints, including shard
+downloads; lower finite `S2_MIN_INTERVAL` values are clamped to that floor, and negative/non-finite values are rejected.
+The shared file gate honours backoff deadlines through 900 seconds, rechecking them in increments of at most 30 seconds.

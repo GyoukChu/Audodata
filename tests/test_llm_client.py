@@ -304,3 +304,13 @@ async def test_endpoint_seed_defaults_and_explicit_call_override():
     await client.chat([])
     await client.chat([], seed=0)
     assert [body["seed"] for body in responder.requests] == [42, 0]
+
+
+async def test_last_request_usage_excludes_billed_retries(monkeypatch):
+    monkeypatch.setattr(LLMClient, '_backoff', staticmethod(lambda _: 0))
+    responder = ScriptedResponder([text_response('', prompt_tokens=7000), text_response('answer', prompt_tokens=7000)])
+    client = LLMClient(endpoint(max_retries=1), transport=make_transport(responder))
+    result = await client.chat([])
+    assert result.usage['prompt_tokens'] == 14000
+    assert result.last_request_usage == {'prompt_tokens': 7000, 'completion_tokens': 5, 'total_tokens': 7005}
+    assert client.usage_totals['prompt_tokens'] == 14000

@@ -277,7 +277,7 @@ class Agent:
                     messages, tools=tool_specs,
                     **({"max_tokens": call_max_tokens} if call_max_tokens is not None else {}),
                 )
-                last_prompt_tokens = completion.usage.get("prompt_tokens")
+                last_prompt_tokens = completion.last_request_usage.get("prompt_tokens")
                 last_prompt_chars = sent_chars
                 for key, value in completion.usage.items():
                     usage[key] = usage.get(key, 0) + value

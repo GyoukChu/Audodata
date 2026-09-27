@@ -34,7 +34,7 @@ src/autodata/
 serving/             vLLM launch scripts, health checks, benchmark harness and notes (4× B200 layout)
 scripts/             smoke / launch / inspection helpers, GPU guard
 docs/                IMPLEMENTATION_SPEC.md, RUNBOOK.md, REPORT.md, knowledge-base/ (paper analysis, prompts, rulings)
-tests/               484 offline tests against a fake OpenAI-compatible server (no GPU, no network)
+tests/               669 offline tests against a fake OpenAI-compatible server (no GPU, no network)
 ```
 
 ## Quick start

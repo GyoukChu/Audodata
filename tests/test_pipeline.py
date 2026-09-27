@@ -106,7 +106,7 @@ async def test_resume_repairs_only_final_qv_and_merges_summary(
                 "final_qv": final_qv, "rounds": [{"sentinel": "original solver result"}],
                 "accepted_round": 1, "errors": ["final_qv: interrupted"]}
     (workdir / "harness_summary.json").write_text(json.dumps(previous))
-    (workdir / "paper.txt").write_text("preserved")
+    (workdir / "paper.txt").write_text(paper.text)
     calls = []
 
     class RepairRun:
@@ -118,7 +118,7 @@ async def test_resume_repairs_only_final_qv_and_merges_summary(
 
         async def run_final_qv_only(self, summary):
             assert summary == previous
-            assert (workdir / "paper.txt").read_text() == "preserved"
+            assert (workdir / "paper.txt").read_text() == paper.text
             assert not PaperLock(workdir).acquire()
             calls.append("repair")
             return {"final_qv": {"qv_completed": True, "passed": True}, "final_accepted": True, "errors": []}
@@ -156,8 +156,8 @@ async def test_shared_driver_passes_repair_keyword_and_retains_accepted_result_o
     previous = {"paper_id": "paper", "completed": True, "accepted": True, "final_qv": None, "rounds": [{}]}
     (workdir / "harness_summary.json").write_text(json.dumps(previous))
 
-    async def repair(*args, repair_final_qv=False):
-        assert repair_final_qv
+    async def repair(*args, repair_final_qv=False, repair=False, prev=None):
+        assert repair_final_qv and repair and prev == previous
         raise RuntimeError("verifier unavailable")
 
     result, = await run_papers(AppConfig(models={}), [PaperInput("paper", "", "")], tmp_path, concurrency=1,

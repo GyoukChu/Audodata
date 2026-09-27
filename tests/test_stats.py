@@ -129,3 +129,60 @@ def test_unreadable_requested_summary_remains_pending(tmp_path):
     (tmp_path / "paper").mkdir()
     (tmp_path / "paper/harness_summary.json").write_text("interrupted JSON")
     assert summarize_agentic(tmp_path)["n_pending"] == 1
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_stats_use_earliest_accepting_candidate_report(tmp_path, legacy):
+    from autodata.cs.evaluate_rubric import compute_question_hash, legacy_question_hash
+    candidate = {'context': 'Context', 'question': 'Why?',
+                 'rubric': [{'criterion': 'Explain.', 'weight': 5, 'category': 'positive'}]}
+    summary = {'paper_id': 'accepted', 'accepted': True, 'final_accepted': True, 'accepted_round': 1,
+               'rounds': [{**candidate, 'weak_avg': 0.1696, 'strong_avg': 0.8, 'gap': 0.6304,
+                           'weak_scores': [0.1696], 'strong_scores': [0.8],
+                           'question_chars': 4, 'n_rubric_items': 1}]}
+    # The directory need not equal paper_id; use the selected summary's actual workspace.
+    write_summary(tmp_path, 'workspace', summary)
+    report = {'question_hash': (legacy_question_hash if legacy else compute_question_hash)(candidate),
+              'all_passed': True, 'started_at': '2026-01-02T00:00:00+00:00',
+              'weak_avg': 0.0994, 'strong_avg': 0.9, 'gap': 0.8006,
+              'weak_attempts': [{'score': 0.0994}], 'strong_attempts': [{'score': 0.9}]}
+    reports = {
+        'run_007_strong-only': report,
+        'run_001_both': {**report, 'started_at': '2026-01-03T00:00:00+00:00', 'weak_avg': 0.2},
+        'run_003_both': {**report, 'started_at': '2026-01-01T00:00:00+00:00', 'question_hash': 'foreign', 'weak_avg': 0.3},
+        'run_004_weak-only': {**report, 'started_at': '2026-01-01T00:00:00+00:00', 'all_passed': False, 'weak_avg': 0.4},
+    }
+    for directory, data in reports.items():
+        path = tmp_path / 'workspace' / 'eval_attempts' / directory / 'report.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(data))
+    archived = {**summary, 'paper_id': 'archived', 'final_accepted': False}
+    write_summary(tmp_path, 'archived', archived)
+    result = summarize_agentic(tmp_path)
+    assert result['n_report_backed'] == result['n_summary_backed'] == 1
+    assert result['table1_after_final_qv']['weak_solver_avg'] == 0.0994
+    assert result['table1_after_final_qv']['strong_solver_avg'] == 0.9
+    assert result['table1_after_final_qv']['gap'] == 0.8006
+    assert result['table1']['weak_solver_avg'] == 0.1345
+    item = next(item for item in result['items'] if item['paper_id'] == 'accepted')
+    assert item['scores_source'] == 'report' and 'run_007' in item['scores_report']
+    assert item['weak_scores'] == [0.0994] and item['strong_scores'] == [0.9]
+    fallback = next(item for item in result['items'] if item['paper_id'] == 'archived')
+    assert fallback['scores_source'] == 'summary' and fallback['weak_scores'] == [0.1696]
+    assert json.loads((tmp_path / 'workspace' / 'harness_summary.json').read_text()) == summary
+
+
+def test_qv_unbound_counts_only_explicit_false_on_accepted_round(tmp_path):
+    for paper_id, accepted, recorded in [
+        ('unbound', True, {'qv_bound': False}),
+        ('bound', True, {'qv_bound': True}),
+        ('legacy', True, {'qv_missing': ['question']}),
+        ('unknown', True, {'qv_bound': None}),
+        ('rejected', False, {'qv_bound': False}),
+    ]:
+        write_summary(tmp_path, paper_id, {
+            'paper_id': paper_id, 'accepted': accepted, 'accepted_round': 2 if accepted else None,
+            'rounds': [{'qv_bound': False}, recorded],
+        })
+    result = summarize_agentic(tmp_path)
+    assert result['n_accepted'] == 4 and result['n_qv_unbound'] == 1

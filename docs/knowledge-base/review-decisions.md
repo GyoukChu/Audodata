@@ -61,3 +61,50 @@ applied automatically; fidelity to the paper wins over reviewer preference when 
 | 14 | README lacks readiness barriers | ACCEPT (P2) | delegated (F4) |
 | 15 | Storage duplication | DEFER | not a correctness issue; revisit before the 10k run |
 | verdict | "not yet ready to claim a Table-1 comparison" | PARTIALLY ACCEPT | smoke24 numbers are valid w.r.t. seeds (all accepted items evaluated unseeded) and the CoT column was computed ungated (before the F2 gate existed); they remain provisional because of #4/#5 (no exploitation observed in transcripts, but not prevented at the time). The pilot is rerun from scratch under the fixed harness. |
+
+## Round 4 — three Codex gpt-6-astra (xhigh) read-only reviews on a5f72f3 (2026-09-27 14:30-15:00): paper fidelity, guardrail correctness, pipeline/stats/docs
+Triage by the orchestrator; every ACCEPT was re-verified against the code, the paper and (where possible) run data before delegation (docs/tasks/round4_job1_core.md, round4_job2_pipeline.md).
+| # | Finding | Decision | Reason / evidence |
+|---|---|---|---|
+| 1 | `--force-strong` never bypassed the first weak gate in the evaluator stage loop -> CoT items with weak >= 0.50 had no strong score and were regenerated on resume (selection into the baseline) | ACCEPT (P0) | confirmed in code and in runs/smoke24_cot (s2_247188082, s2_248227281 had strong=None); one-line fix applied immediately (evaluator subprocess picks it up); regression test + CoT repair path (complete the frozen candidate instead of regenerating) |
+| 2 | QV binding: first-80-alphanumerics window misses weights after long criteria; unsigned weight ("1" in "10", +5 -> -5 unbound) | ACCEPT (P1) | 269 of 317 accepted smoke criteria exceed 120 alphanumerics; the check passed only because of the agent's prompt format; new rule = full criterion + signed weight within 60 chars before/after, validated against real QV prompts |
+| 3 | Evaluation cache bypass via JSON key order / whitespace (hash of json.dumps) and via mode switch (weak-only -> both) | ACCEPT (P0/P1) | canonical hash (sort_keys, NFC) + stage-aware cache; legacy hashes still matched for the running pilot |
+| 4 | Challenger-origin check compares alphanumerics only (operator/Greek-letter edits pass) | ACCEPT (P0) | NFC + whitespace-collapsed exact comparison; unparseable challenger JSON -> exact substring of its output (the main agent may repair JSON, never edit the question) |
+| 5 | QV template echo (`OVERALL: PASS | FAIL`) parses as PASS | ACCEPT (P1) | unresolved alternatives -> None / missing check |
+| 6 | Rubric weight range 1..10 blocks acceptance (my round-3 addition) | ACCEPT (fidelity fix) | the paper's harness never rejects rubrics by weight range and Fig. 9 checks only counts; pilot paper s2_168844958 lost two rounds to it; now a non-blocking warning |
+| 7 | Smoke summary of s2_288742856 carries a weak score from a weak-only run made AFTER acceptance (0.1696 vs accepting report 0.0994) | ACCEPT (P0 for reporting) | eval-after-accept is refused since round 3; statistics now read the acceptance-time report; smoke numbers to be regenerated |
+| 8 | REPORT.md "paper: 2%" misattributed | ACCEPT (docs) | the paper's 2% is "only ~2% use a single round" (Sec 4), reworded |
+| 9 | Final-QV repair keeps resolved `final_qv:` errors / `completed=False` -> next resume regenerates an accepted paper; `question_type` missing -> IndexError; repair transcript name reuse; repaired summaries re-stamped with the current fingerprints | ACCEPT (P1) | confirmed by reading the repair path; terminal state = accepted + final QV completed; original fingerprints preserved, repair fingerprints recorded separately |
+| 10 | Context preflight uses cumulative retry usage as the prompt size | ACCEPT (P1) | last successful request's usage exposed separately |
+| 11 | PR_SET_PDEATHSIG armed late (after imports) -> orphan on early parent death | ACCEPT (P1, cheap) | armed at import, expected parent pid checked |
+| 12 | Cohort manifest ignores corpus sha1 and imported legacy fingerprints; per-paper text changes reuse old results | ACCEPT (P1) | corpus fields in the mismatch check + `imports` record + paper.txt sha1 check on resume |
+| 13 | Corpus builder resume ignores changed filters | ACCEPT (P2) | validate existing records + `<out>.meta.json` |
+| 14 | S2 limiter floor 1.0 s; shared-file gate drops deadlines > 600 s | ACCEPT (P1) | floor 3.0 s (user rule), gate honours up to 900 s |
+| 15 | CoT QV infrastructure failure = permanent rejection | ACCEPT (P1) | error + repair on the frozen candidate |
+| 16 | Stale test count in docs | ACCEPT (docs) | |
+| 17 | "Reject an unparseable challenger candidate outright" | REJECT (partial) | the paper's main agent may repair malformed challenger JSON; keeping an exact-substring fallback preserves that behaviour while blocking edits |
+| 18 | "Construct the QV request from the immutable candidate in the harness" | REJECT | in the paper the main agent composes the quality-verifier prompt (RAM README); the harness only verifies that the prompt contained the evaluated candidate |
+
+### Round 4 addendum — in-loop QV binding made informational (orchestrator decision, 2026-09-27 15:40)
+Codex's strict binding (full criterion text or 80-char prefix + signed weight adjacent) bound only 14 of the 22
+accepted smoke candidates. Checking the accepted candidates against their rounds' challenger outputs showed why: the
+main agent (GLM-5.3) rewrote the candidate before evaluation in the smoke run (rubric differs from the challenger's in
+11/22 accepted items, context in 5/22, question in 2/22) and paraphrased or relabelled the rubric in its
+quality-verifier prompts (P/N labels, magnitudes without signs, shortened criteria). The paper's pipeline has no
+harness-side binding at all, and its real quality filter is the end-of-loop verifier, which this harness runs on the
+exact accepted candidate with a harness-built prompt. A blocking in-loop binding would therefore have refused or
+delayed ~36% of paper-faithful acceptances. Decision: `qv_bound` / `qv_missing` are recorded on every round and on the
+accepted record (event `qv_not_bound`, informational; statistic `n_qv_unbound`), acceptance is never refused for it.
+The question-origin check stays blocking (the verbatim prompt says the main agent must not write questions), the
+QV-repeat refusal stays keyed on the question (the prompt says a failed QV goes back to the challenger with feedback).
+
+### Round 4 incident — evaluator/harness version skew during the pilot (2026-09-27 15:09-15:39)
+The evaluator runs as a fresh subprocess and imports the working tree, while runner processes keep the code they
+started with. A Codex edit at 15:09 switched the evaluator's report `question_hash` to a new canonical identity; the
+running pilot harness (old code) then marked every new report unverified ("question_hash mismatch", cascading into
+"weak result provenance"). One genuine acceptance was lost (runs/pilot/s2_281674067, round 2: weak 0.348, strong
+0.788). Fix at 15:39: `question_hash` keeps the legacy identity, `question_hash_canonical` carries the new one; harness,
+evaluator reuse and statistics accept either. Affected papers are re-adjudicated by scripts/readjudicate_refused.py
+(exact recomputation from the recorded judgments; qualifying only when every refusal reason is a withdrawn check), which
+also covers runs/pilot/s2_269282862 (refused only by the formerly blocking QV binding). Rule added to the runbook: any
+evaluator report change must stay readable by already-running harness processes.
