@@ -85,26 +85,27 @@ harness and excluded by the statistics.
   effect is to find questions the strong solver can actually answer (strong 0.51 → 0.85) while keeping the weak solver
   low — the paper's discriminative objective reached from the opposite starting point (paper: CoT questions too easy).
 
-## 6b. Pilot (320 papers) — interim snapshot 2026-09-28 04:17 (runs/pilot_stats.interim.json)
-| Metric (Table 1 analogue) | Paper: CoT | Paper: Agentic | Ours: CoT (n=76) | Ours: Agentic accepted (n=51) | Ours: after final QV (n=47) |
+## 6b. Pilot (320 papers) — interim snapshot 2026-09-28 07:06, paused for a container restart (runs/pilot_stats.interim.json)
+| Metric (Table 1 analogue) | Paper: CoT | Paper: Agentic | Ours: CoT (n=86) | Ours: Agentic accepted (n=60) | Ours: after final QV (n=55) |
 |---|---|---|---|---|---|
-| Weak solver avg | 0.677 | 0.458 | 0.255 | 0.245 | 0.239 |
-| Strong solver avg | 0.696 | 0.772 | 0.466 | 0.833 | 0.833 |
-| Gap (strong − weak) | 0.019 | 0.314 | 0.211 | 0.588 | 0.594 |
-| Agentic rounds (mean / median / max) | 1 | 6.59 | 1 | 3.90 / 4 / 9 | — |
-| Question length (chars) | 723 | 619 | 665 | 1083 | — |
-| Rubric items | 13.2 | 13.1 | 14.5 | 13.7 | — |
+| Weak solver avg | 0.677 | 0.458 | 0.253 | 0.253 | 0.246 |
+| Strong solver avg | 0.696 | 0.772 | 0.459 | 0.831 | 0.832 |
+| Gap (strong − weak) | 0.019 | 0.314 | 0.206 | 0.579 | 0.585 |
+| Agentic rounds (mean / median / max) | 1 | 6.59 | 1 | 3.85 / 4 / 9 | — |
+| Question length (chars) | 723 | 619 | 663 | 1083 | — |
+| Rubric items | 13.2 | 13.1 | 14.5 | 13.9 | — |
 
-* Progress: 51 of 320 agentic papers completed (22 reused from the smoke run), all accepted within 9 rounds; 47 also
-  pass the end-of-loop quality verifier. CoT: 76 of 320 evaluated, 21% of single-shot questions would already satisfy
-  the solver criteria. All 51 accepted items are scored from their acceptance-time evaluator report.
-* Failed rounds (148): FAILED ON STRONG 51%, TOO EASY 36%, FAILED QV 10%, no QV 3% (paper: 80% too easy, 13% strong
-  failed) — as in the smoke run, the 27B strong solver, not the weak solver, is the binding constraint.
+* Progress: 60 of 320 agentic papers completed (22 reused from the smoke run), all accepted within 9 rounds; 55 also
+  pass the end-of-loop quality verifier. CoT: 86 of 320 evaluated; 20% of single-shot questions would already satisfy
+  the solver criteria. All accepted items are scored from their acceptance-time evaluator report.
+* Failed rounds (171): FAILED ON STRONG 51%, TOO EASY 34%, FAILED QV 9%, no QV/eval 5% (paper: 80% too easy, 13%
+  strong failed) — as in the smoke run, the 27B strong solver, not the weak solver, is the binding constraint.
 * Nine pilot papers were refused acceptance only by harness checks withdrawn in review round 4 (blocking in-loop QV
   binding; evaluator/harness version skew; rubric weight range). They were re-adjudicated from the recorded judgments
   with an exact recomputation (scripts/readjudicate_refused.py) and all nine then passed the end-of-loop verifier.
 * Throughput: ~2.2 papers/hour at 8 agentic + 2 CoT slots (GLM-5.3 is KV-bound by orchestrator contexts of up to
-  ~220k tokens; the 290k context budget is kept for fidelity by user decision); the remaining 269 papers need ~5 days.
+  ~220k tokens; the 290k context budget is kept for fidelity by user decision); ~5 days remain for 260 papers.
+* Paused 2026-09-28 07:06 for a container restart; `scripts/resume_pilot.sh` resumes it (interrupted papers rerun).
 
 ## 7. Known limitations / next steps
 - Throughput: measured GLM-5.3 generation is ~490 tokens/s aggregate at 8+2 concurrent papers, or ~10-16 rounds/hour;
