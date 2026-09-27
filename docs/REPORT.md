@@ -47,23 +47,28 @@ at 8-32 concurrent; solvers slow to 40-50% while GLM is busy. GPUs 0-1 keep only
 - Real-server probes: challenger JSON (14-15 criteria), QV 7-line verdict, judge JSON, evaluator reports.
 - First accepted items verified end to end: harness verdict == agent's result.json claim; final QV passed.
 
-## 6. Results (smoke, 24 papers) — see runs/smoke24_stats.json
-Interim snapshot at 11:05 (14 of 24 papers finished; refreshed at the end by `autodata-stats`):
+## 6. Results (smoke, 24 papers) — runs/smoke24_stats.json (2026-09-27 12:56)
+| Metric (Table 1 analogue) | Paper: CoT | Paper: Agentic | Ours: CoT (n=22) | Ours: Agentic accepted (n=22) | Ours: after final QV (n=20) |
+|---|---|---|---|---|---|
+| Weak solver avg | 0.677 | 0.458 | 0.234 | 0.257 | 0.249 |
+| Strong solver avg | 0.696 | 0.772 | 0.507 | 0.848 | 0.848 |
+| Gap (strong − weak) | 0.019 | 0.314 | 0.272 | 0.595 | 0.603 |
+| Agentic rounds (mean / median / max) | 1 | 6.59 | 1 | 3.41 / 3 / 7 | — |
+| Question length (chars) | 723 | 619 | 659 | 1011 | — |
+| Rubric items | 13.2 | 13.1 | 14.5 | 14.4 | — |
 
-| Metric (Table 1 analogue) | Paper: CoT | Paper: Agentic | Ours: CoT (n=21) | Ours: Agentic accepted (n=14) |
-|---|---|---|---|---|
-| Weak solver avg | 0.677 | 0.458 | 0.223 | 0.266 |
-| Strong solver avg | 0.696 | 0.772 | 0.490 | 0.840 |
-| Gap (strong − weak) | 0.019 | 0.314 | 0.268 | 0.574 |
-| Agentic rounds (mean / median / max) | 1 | 6.59 | 1 | 2.71 / 3 / 4 |
-| Question length (chars) | 723 | 619 | 652 | 1068 |
-| Rubric items | 13.2 | 13.1 | 14.5 | 14.6 |
-
-Failed-round modes so far: FAILED ON STRONG 54%, TOO EASY 29%, FAILED QV 17% (paper: 80% too easy, 13% strong failed).
-Reading: with a 27B strong solver, single-shot GLM questions are already hard for the 4B (weak 0.22) and the loop's main
-effect is to find questions the strong solver can actually answer (strong 0.49 -> 0.84) while keeping the weak solver low,
-i.e. the same "discriminative" objective as the paper reached from the opposite starting point (paper: CoT questions too
-easy). Acceptance rate so far 100% within <= 4 rounds; 12 of 14 accepted items also pass the end-of-loop QV.
+* Acceptance: 22 of 24 papers (92%) within ≤ 7 rounds; 20 of the 22 also pass the end-of-loop quality verifier.
+  The 2 non-accepted papers ended in a context-length error of the main agent (prompt 318k tokens + 81,920 output >
+  400k max-model-len after 4 and 8 rounds); the reasoning-aware token budget added afterwards prevents this and the two
+  papers are being rerun.
+* Failed rounds (65): FAILED ON STRONG 45%, TOO EASY 41%, FAILED QV 12% (paper: 80% too easy, 13% strong failed).
+* Cost: ~75.6M main-agent prompt tokens (prefix-cached), 1.7M main-agent completion tokens, 3.9M subagent completion
+  tokens for 24 papers; ~8.5 h wall clock at 8-way concurrency (≈ 3 papers/hour).
+* 36% of the single-shot CoT questions would already satisfy the solver criteria (paper: 2%), and 5 papers show a
+  bookkeeping mismatch between the agent's result.json and the harness verdict (the harness verdict is authoritative).
+* Reading: with a 27B strong solver, single-shot GLM questions are already hard for the 4B (weak 0.23); the loop's main
+  effect is to find questions the strong solver can actually answer (strong 0.51 → 0.85) while keeping the weak solver
+  low — the paper's discriminative objective reached from the opposite starting point (paper: CoT questions too easy).
 
 ## 7. Known limitations / next steps
 - Throughput: ~40 min per paper at 8-way concurrency (dominated by GLM reasoning at max effort); a 320-paper pilot needs
