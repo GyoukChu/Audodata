@@ -118,7 +118,8 @@ class RunConfig(BaseModel):
     final_rubric_max_items: int = 20
     final_rubric_min_positive: int = 4
     final_rubric_min_negative: int = 3
-    seed: int = 0  # default for endpoints without an explicit seed
+    seed: int | None = None  # None = independent sampling (paper: 3 attempts to reduce variance). When set, the
+    # evaluator derives a DISTINCT seed per (question, role, attempt) so attempts stay independent but reproducible.
 
 
 class AppConfig(BaseModel):
@@ -145,8 +146,9 @@ class AppConfig(BaseModel):
     def endpoint(self, role: str) -> ModelEndpoint:
         try:
             endpoint = self.models[role]
-            return (endpoint if endpoint.seed is not None
-                    else endpoint.model_copy(update={"seed": self.run.seed}))
+            if endpoint.seed is not None or self.run.seed is None:
+                return endpoint
+            return endpoint.model_copy(update={"seed": self.run.seed})
         except KeyError as e:
             raise KeyError(f"no model endpoint configured for role {role!r}; have {list(self.models)}") from e
 

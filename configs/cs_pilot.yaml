@@ -14,7 +14,7 @@ run:
   paper_text_max_chars: 200000
   paper_text_min_chars: 8000
   final_qv: true
-  seed: 0
+  seed: null   # independent sampling for the 3 solver attempts; set an int for reproducible, per-attempt-distinct seeds
 acceptance_preset: prose_s31
 eval:
   n_attempts: 3

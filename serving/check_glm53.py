@@ -5,6 +5,7 @@
 (b) tool call: tools=[one function], a prompt that forces a call -> message.tool_calls with JSON-parseable arguments
 (c) two-turn tool round trip: assistant message (with tool_calls) + tool result -> final answer
 (d) extra_body={"chat_template_kwargs": {"reasoning_effort": "max"}} is accepted
+(e) /tokenize + /detokenize preserves assistant reasoning in the rendered tool history
 
 Usage: python serving/check_glm53.py [--base-url http://127.0.0.1:8000/v1] [--model glm-5.3]
 Exit code 0 only if every check passes.
@@ -57,6 +58,19 @@ def short(text: str | None, n: int = 300) -> str:
         return "None"
     text = text.strip().replace("\n", " ")
     return text if len(text) <= n else text[:n] + f"... [{len(text)} chars]"
+
+
+def assert_rendered_reasoning(client: OpenAI, model: str, messages: list[dict], reasoning: str | None) -> None:
+    assert reasoning, "tool-call response has no reasoning to check"
+    # vLLM's tokenizer routes are at the server root, outside the OpenAI /v1 prefix.
+    root = str(client.base_url).rstrip("/").removesuffix("/v1")
+    tokenized = client.post(f"{root}/tokenize", cast_to=dict, body={
+        "model": model, "messages": messages, "tools": [WEATHER_TOOL], "add_generation_prompt": True,
+    })
+    rendered = client.post(f"{root}/detokenize", cast_to=dict, body={
+        "model": model, "tokens": tokenized["tokens"],
+    })
+    assert reasoning in rendered["prompt"], "chat template dropped assistant reasoning from history"
 
 
 def run(client: OpenAI, model: str, max_tokens: int) -> dict[str, bool]:
@@ -113,6 +127,7 @@ def run(client: OpenAI, model: str, max_tokens: int) -> dict[str, bool]:
         }
         rfield, rtext = reasoning_of(msg)
         if rtext:
+            assistant["reasoning"] = rtext
             assistant["reasoning_content"] = rtext
         messages.append(assistant)
         for c in calls:
@@ -123,6 +138,13 @@ def run(client: OpenAI, model: str, max_tokens: int) -> dict[str, bool]:
                     "content": json.dumps({"city": "Paris", "temperature": 18, "unit": "celsius", "condition": "light rain"}),
                 }
             )
+        try:
+            assert_rendered_reasoning(client, model, messages, rtext)
+            results["e_rendered_reasoning"] = True
+            print("[e] rendered tool history preserves assistant reasoning")
+        except Exception as exc:
+            results["e_rendered_reasoning"] = False
+            print(f"[e] rendered reasoning FAILED: {exc!r}")
         resp = client.chat.completions.create(
             model=model, messages=messages, tools=[WEATHER_TOOL], tool_choice="auto", max_tokens=max_tokens
         )
@@ -134,6 +156,7 @@ def run(client: OpenAI, model: str, max_tokens: int) -> dict[str, bool]:
     else:
         print("[c] skipped: no tool call in (b)")
         results["c_tool_round_trip"] = False
+        results["e_rendered_reasoning"] = False
 
     # (d) reasoning_effort=max through chat_template_kwargs
     t0 = time.time()

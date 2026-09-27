@@ -12,7 +12,7 @@ run:
   paper_text_max_chars: 200000
   paper_text_min_chars: 8000
   final_qv: true                # end-of-loop quality verifier (Sec 3.1)
-  seed: 0
+  seed: null   # independent sampling for the 3 solver attempts; set an int for reproducible, per-attempt-distinct seeds
 acceptance_preset: prose_s31    # strong_avg >= 0.65, weak_avg < 0.50, gap >= 0.20 (Sec 3.1 prose); alt: deployed_c1
 eval:
   n_attempts: 3                 # "each invoked 3 times to reduce variance"

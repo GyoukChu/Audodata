@@ -2,11 +2,11 @@
 .venv/
 .env
 env.local.sh
-.cache/
+/.cache/
 # run artefacts and data (regenerate with the runbook)
-runs/
-data/
-logs/
+/runs/
+/data/
+/logs/
 *.log
 _archive/
 _locks/

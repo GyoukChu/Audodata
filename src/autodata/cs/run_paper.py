@@ -226,8 +226,9 @@ def final_filter(cfg: AppConfig, context: str, rubric: Any) -> dict:
         items = parse_rubric(rubric)
         n_pos = sum(1 for it in items if it.weight > 0)
         n_neg = sum(1 for it in items if it.weight < 0)
+        weights_ok = all(1 <= abs(it.weight) <= 10 for it in items)  # challenger spec (Fig. 8): +1..+10 / -1..-10
         # Defaults also support RunConfig versions predating these shape knobs.
-        ok = (getattr(cfg.run, "final_rubric_min_items", 10) <= len(items)
+        ok = weights_ok and (getattr(cfg.run, "final_rubric_min_items", 10) <= len(items)
               <= getattr(cfg.run, "final_rubric_max_items", 20)
               and n_pos >= getattr(cfg.run, "final_rubric_min_positive", 4)
               and n_neg >= getattr(cfg.run, "final_rubric_min_negative", 3))
@@ -370,6 +371,17 @@ class PaperRun:
             rec = RoundRecord(index=len(self.rounds) + 1, started_at=time.time(), challenger_prompt=prompt)
             self.rounds.append(rec)
             self.log(f"[{self.paper.paper_id}] round {rec.index}: challenger")
+        if subagent_type == "quality_verifier" and self.rounds:
+            rec0 = self.rounds[-1]
+            q_alnum = _alnum((rec0.challenger_json or {}).get("question"))
+            for prev in rec0.qv_calls:
+                if prev.get("stop_reason") == "final" and q_alnum and q_alnum in prev.get("prompt_alnum", "") and q_alnum in _alnum(prompt):
+                    verdict = "PASS" if prev["parsed"].get("overall") else "FAIL"
+                    self._guard("qv_repeat", f"repeated QV on the same question refused (previous verdict {verdict})")
+                    return (f"Quality verification for this question was already completed in this round with OVERALL: {verdict}. "
+                            "Do not repeat it: " + ("proceed to evaluation." if verdict == "PASS" else
+                            "add it to the failed quality check list and ask the challenger for an ENTIRELY NEW question.")
+                            + "\n\n[previous verifier output]\n" + prev["output"][-4000:])
         self.subagent_counter[subagent_type] += 1
         n = self.subagent_counter[subagent_type]
         agent = self._make_subagent(subagent_type, n)
@@ -394,7 +406,7 @@ class PaperRun:
             if result.stop_reason != "final":
                 parsed = {**parsed, "overall": False, "incomplete": True}
             rec.qv_calls.append({"prompt": prompt, "output": text, "parsed": parsed, "description": description,
-                                 "stop_reason": result.stop_reason})
+                                 "stop_reason": result.stop_reason, "prompt_alnum": _alnum(prompt)})
             self.log(f"[{self.paper.paper_id}] round {rec.index}: QV -> {parsed.get('overall')}"
                      + (" (contradiction)" if parsed.get("contradiction") else ""))
         return text
@@ -494,6 +506,8 @@ class PaperRun:
         n_req = self.cfg.eval.n_attempts
         if (report.get("eval") or {}).get("n_attempts") != n_req:
             problems.append("n_attempts in report differs from the run config")
+        if not self.rubric_weights_in_bounds(candidate.get("rubric")):
+            problems.append("rubric weights outside the challenger spec (|weight| must be 1..10)")
         verdict: dict[str, Any] = harness_predicate(self.cfg.acceptance, None, None)
         try:
             items = parse_rubric(candidate.get("rubric"))
@@ -514,7 +528,8 @@ class PaperRun:
 
     def _qv_bound(self, rec: RoundRecord, candidate: dict[str, Any]) -> bool:
         """The round's (last) QV call must have reviewed THIS candidate: the question, the head of the context and every
-        rubric criterion must appear in the QV prompt (compared on alphanumerics only, so JSON escaping does not matter)."""
+        rubric criterion WITH ITS WEIGHT must appear in the QV prompt (compared on alphanumerics only, so JSON escaping
+        does not matter; the weight must sit within 40 characters of its criterion, as in a JSON item or a bullet)."""
         if not rec.qv_calls:
             return False
         prompt = _alnum(rec.qv_calls[-1]["prompt"])
@@ -525,8 +540,31 @@ class PaperRun:
         if ctx and ctx not in prompt:
             return False
         for item in candidate.get("rubric") or []:
-            crit = _alnum(item.get("criterion") if isinstance(item, dict) else "")[:80]
-            if crit and crit not in prompt:
+            if not isinstance(item, dict):
+                return False
+            crit = _alnum(item.get("criterion"))[:80]
+            if not crit:
+                return False
+            pos = prompt.find(crit)
+            if pos < 0:
+                return False
+            weight = str(abs(int(item.get("weight", 0)))) if str(item.get("weight", "")).lstrip("+-").isdigit() else ""
+            window = prompt[max(0, pos - 40):pos] + prompt[pos + len(crit):pos + len(crit) + 40]
+            if not weight or weight not in window:
+                return False
+        return True
+
+    @staticmethod
+    def rubric_weights_in_bounds(rubric: Any, lo: int = 1, hi: int = 10) -> bool:
+        """Challenger spec (Fig. 8): positive weights +1..+10, negative weights -1..-10."""
+        if not isinstance(rubric, list) or not rubric:
+            return False
+        for item in rubric:
+            try:
+                w = int(item.get("weight"))
+            except Exception:
+                return False
+            if not (lo <= abs(w) <= hi):
                 return False
         return True
 
@@ -551,6 +589,26 @@ class PaperRun:
             rec.evals.append({"mode": mode, "argv": argv, "stdout": f"INPUT_ERROR: {e}", "report": None,
                               "candidate": None, "input_sha1": input_sha1, "returncode": None, "elapsed_s": 0.0})
             return f"INPUT_ERROR: eval_input.json is not valid JSON ({e}). Rewrite it with the write tool."
+        qh = compute_question_hash(candidate)
+        if self.accepted_round_idx is not None:
+            self._guard("eval_after_accept", "evaluation refused after acceptance")
+            return (f"A question was already ACCEPTED in round {self.accepted_round_idx}. No further evaluations: write the final "
+                    "output/result.json (with final_accepted_round set) and stop.")
+        # the evaluated question must be the challenger's question for this round (the main agent never writes questions)
+        cj = rec.challenger_json or {}
+        cand_q = _alnum(candidate.get("question"))
+        origin_ok = bool(cand_q) and (
+            (cj.get("question") and _alnum(cj.get("question")) == cand_q) or
+            (not cj.get("question") and cand_q in _alnum(rec.challenger_output)))
+        if not origin_ok:
+            self._guard("eval_foreign_candidate", "evaluation refused: the question is not this round's challenger output")
+            return ("Error: the question in eval_input.json is not the challenger's question for this round. Only the "
+                    "challenger writes questions: call the challenger (a new round) and evaluate its output unchanged.")
+        for prev in reversed(rec.evals):
+            if prev.get("question_hash") == qh and prev.get("mode") == mode and prev.get("verified"):
+                self._guard("eval_repeat", f"repeated {mode} evaluation of the same question served from cache")
+                return prev["stdout"] + "\n[cached: this question was already evaluated in this mode in this round; a completed " \
+                                        "result is final - to change the outcome, ask the challenger for an ENTIRELY NEW question]"
         eval_dir = (self.workdir / EVAL_DIR_REL).resolve()
         before = {p.resolve() for p in eval_dir.glob("run_*")}
         deadline = evaluator_deadline_s(self.cfg, mode, float(opts["timeout_s"]))
@@ -659,6 +717,8 @@ class PaperRun:
         if rec.index == self.accepted_round_idx and self.accepted:
             cand = self.accepted["candidate"]
             ref = self.accepted.get("reference_answer")
+            frozen = self.accepted.get("verdict") or {}
+            weak, strong = frozen, frozen  # scores of the accepted candidate, never a later evaluation
         else:
             cand = rec.last_candidate() or {}
             ref = cj.get("reference_answer") if _norm(cj.get("question"))[:120] == _norm(cand.get("question"))[:120] else None

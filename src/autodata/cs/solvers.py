@@ -141,7 +141,7 @@ class SolverAttempt:
 def run_solver(
     client: SyncClient, context: str, question: str,
     template_path: str | Path = PROMPTS_DIR / "solver_user.md", *,
-    retries: int = 3, timeout: float | None = None,
+    retries: int = 3, timeout: float | None = None, seed: int | None = None,
 ) -> SolverAttempt:
     if retries < 0:
         raise ValueError("retries must be nonnegative")
@@ -153,9 +153,9 @@ def run_solver(
     for attempt in range(retries + 1):
         request_started = time.perf_counter()
         try:
-            reply = client.chat(messages, timeout=timeout)
+            reply = client.chat(messages, timeout=timeout, seed=seed)
             record = asdict(reply)
-            record["seed"] = client.request_seed
+            record["seed"] = seed if seed is not None else client.request_seed
             answer, inline = strip_reasoning(reply.content)
             reasoning = reply.reasoning
             finish = reply.finish_reason
@@ -172,7 +172,7 @@ def run_solver(
             can_retry = True
         except (openai.OpenAIError, httpx.TransportError, ValueError, TypeError, AttributeError) as exc:
             error = error_text(exc)
-            requests.append({"error": error, "usage": {}, "seed": client.request_seed,
+            requests.append({"error": error, "usage": {}, "seed": seed if seed is not None else client.request_seed,
                              "latency_s": time.perf_counter() - request_started})
             can_retry = retryable(exc)
         if attempt == retries or not can_retry:

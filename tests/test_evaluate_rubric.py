@@ -394,11 +394,20 @@ def test_solver_judge_seeds_reach_wire_and_attempt_files(tmp_path, capsys, seed_
     for body in calls:
         role = body["model"] + ("_solver" if body["model"] != "judge" else "")
         expected = seeds[role] if seed_source != "unset" else None
-        assert body.get("seed") == expected
-        assert ("seed" in body) == (expected is not None)
+        if role in ("weak_solver", "strong_solver") and expected is not None:
+            # solver attempts get DISTINCT derived seeds (review: identical seeds collapse the 3 attempts into one sample)
+            assert body.get("seed") is not None and body.get("seed") != expected
+        else:
+            assert body.get("seed") == expected
+            assert ("seed" in body) == (expected is not None)
     for role in ("weak", "strong"):
         attempt = json.loads(Path(report[f"{role}_attempts"][0]["attempt_path"]).read_text())
-        assert attempt["requests"][0]["seed"] == (seeds[f"{role}_solver"] if seed_source != "unset" else None)
+        if seed_source != "unset":
+            from autodata.cs.evaluate_rubric import attempt_seed
+            data = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
+            assert attempt["requests"][0]["seed"] == attempt_seed(seeds[f"{role}_solver"], data, role, attempt["index"])
+        else:
+            assert attempt["requests"][0]["seed"] is None
         assert attempt["judge"]["requests"][0]["seed"] == (seeds["judge"] if seed_source != "unset" else None)
 
 
@@ -413,7 +422,8 @@ def test_solver_records_seeds_for_failed_and_retried_requests(tmp_path, capsys):
     assert main(argv + ["--weak-only"], transport=make_transport(retry)) == 0
     report, _ = read_report(capsys.readouterr().out)
     attempt = json.loads(Path(report["weak_attempts"][0]["attempt_path"]).read_text())
-    assert [request["seed"] for request in attempt["requests"]] == [0, 0]
+    derived = attempt["requests"][0]["seed"]
+    assert derived is not None and [request["seed"] for request in attempt["requests"]] == [derived, derived]  # retries keep the attempt seed
 
 
 def test_strong_without_matching_weak_omits_gap(tmp_path, capsys):
@@ -708,3 +718,13 @@ def test_every_report_records_input_and_config_provenance(tmp_path, capsys, mode
     assert report["input_path"] == str(Path(argv[1]).resolve())
     assert report["prompts_dir"] == str(PROMPTS_DIR.resolve())
     assert report["models"] == {role: config[role]["model"] for role in ("weak_solver", "strong_solver", "judge")}
+
+
+def test_three_attempts_get_distinct_seeds_when_seeded(tmp_path):
+    from autodata.cs.evaluate_rubric import attempt_seed
+    data = {"context": "c", "question": "q", "rubric": [{"criterion": "a", "weight": 2, "category": "positive"}]}
+    seeds = {attempt_seed(7, data, "weak", i) for i in (1, 2, 3)}
+    assert len(seeds) == 3 and all(0 <= x < 2**31 for x in seeds)
+    assert attempt_seed(7, data, "weak", 1) == attempt_seed(7, data, "weak", 1)  # reproducible
+    assert attempt_seed(7, data, "strong", 1) != attempt_seed(7, data, "weak", 1)
+    assert attempt_seed(None, data, "weak", 1) is None

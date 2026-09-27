@@ -416,3 +416,99 @@ async def test_agent_reports_spend_when_empty_retries_are_exhausted(monkeypatch)
     assert result.stop_reason == "error"
     assert result.usage["prompt_tokens"] == client.usage_totals["prompt_tokens"] == 20
     assert result.usage["completion_tokens"] == client.usage_totals["completion_tokens"] == 10
+
+
+@pytest.mark.parametrize("name", ["main_agent", "challenger", "quality_verifier"])
+@pytest.mark.parametrize("model_len,expected_tokens", [(11000, 10000), (9192, 8192), (9191, None), (999, None)])
+async def test_hard_context_first_request_and_completion_floor(name, model_len, expected_tokens):
+    client, responder = client_for([text_response("done")], max_tokens=10000)
+    events = []
+    result = await Agent(name=name, system_prompt="s" * 2000, tools=[], llm=client, max_steps=1,
+                         max_model_len=model_len, event_hook=events.append).run("u" * 2000)
+    assert client.endpoint.max_tokens == 10000  # Shared client defaults are never changed.
+    if expected_tokens is None:
+        assert result.stop_reason == "error" and "context preflight" in result.error
+        assert not responder.requests and result.usage["calls"] == 0
+        assert any(event.data.get("action") == "context_limit_exceeded" for event in events)
+    else:
+        assert result.stop_reason == "final"
+        assert responder.requests[0]["max_tokens"] == expected_tokens
+        assert 1000 + expected_tokens <= model_len
+        assert any(event.data.get("action") == "lower_max_tokens" for event in events) == (expected_tokens < 10000)
+
+
+@pytest.mark.parametrize("reasoning_chars,tool_chars,keep,actions", [
+    (1000, 3000, 1, ["elide_tool_result"]),
+    (6000, 500, 1, ["elide_tool_result", "drop_reasoning"]),
+    (500, 6000, 6, ["shrink_protected_window", "drop_reasoning", "shrink_protected_window", "elide_tool_result"]),
+])
+async def test_hard_context_compaction_order_and_protected_window(
+    tmp_path, reasoning_chars, tool_chars, keep, actions,
+):
+    from autodata.harness.agent import _message_chars
+
+    requests = []
+
+    def respond(request, index):
+        requests.append(request)
+        prompt_tokens = (sum(_message_chars(message) for message in request["messages"])
+                         + len(json.dumps(request["tools"], ensure_ascii=False))) / 4
+        assert prompt_tokens + request["max_tokens"] <= 12500
+        response = (tool_call_response([("read", {})], reasoning="r" * reasoning_chars)
+                    if index < (3 if tool_chars == 3000 else 2) else text_response("done"))
+        response["usage"]["prompt_tokens"] = int(prompt_tokens)
+        return response
+
+    client = LLMClient(ModelEndpoint(base_url="http://fake/v1", model="m", max_tokens=10000, max_retries=0),
+                       transport=make_transport(respond))
+    events = []
+    path = tmp_path / "hard_context.jsonl"
+    result = await Agent(name="main", system_prompt="s", tools=[
+        Tool("read", "read", {}, AsyncMock(return_value="t" * tool_chars)),
+    ], llm=client, max_steps=4, max_model_len=12500, keep_recent_tool_results=keep,
+        event_hook=events.append, transcript_path=path).run("u")
+    assert result.stop_reason == "final"
+    assert [event.data["action"] for event in events if event.kind == "elide"] == actions
+    assert all(request["max_tokens"] == 10000 for request in requests)
+    history = requests[-1]["messages"]
+    assert history[-1]["content"] == "t" * tool_chars
+    assert history[-2]["reasoning"] == history[-2]["reasoning_content"] == "r" * reasoning_chars
+    assert [message["tool_call_id"] for message in history if message["role"] == "tool"] == [
+        call["id"] for message in history for call in message.get("tool_calls", [])
+    ]
+    original_tools = [row["message"] for row in records(path)
+                      if row["type"] == "message" and row["message"]["role"] == "tool"]
+    assert all(message["content"] == "t" * tool_chars for message in original_tools)
+
+
+@pytest.mark.parametrize("measured_tokens,expected_tokens", [(12000, 8249), (12100, None)])
+async def test_hard_context_uses_measured_usage_plus_appended_reasoning_arguments_and_results(
+    measured_tokens, expected_tokens,
+):
+    response = tool_call_response([("read", {"key": "x" * 1000})], reasoning="r" * 1000)
+    response["usage"]["prompt_tokens"] = measured_tokens
+    client, responder = client_for([response, text_response("done")], max_tokens=10000)
+    result = await Agent(name="challenger", system_prompt="s", llm=client, max_steps=2,
+                         tools=[Tool("read", "read", {}, AsyncMock(return_value="t" * 1000))],
+                         max_model_len=21002).run("u")
+    if expected_tokens is None:
+        assert result.stop_reason == "error" and len(responder.requests) == 1
+    else:
+        # JSON arguments are 1011 chars, reasoning is counted only once despite its two aliases.
+        assert responder.requests[1]["max_tokens"] == expected_tokens
+        assert measured_tokens + 3011 / 4 + expected_tokens <= 21002
+        assert result.stop_reason == "final"
+
+
+async def test_hard_context_includes_tool_definitions_on_first_call():
+    client, responder = client_for([text_response("unused")], max_tokens=10000)
+    result = await Agent(name="main", system_prompt="s", llm=client, max_steps=1, max_model_len=11000,
+                         tools=[Tool("read", "d" * 44000, {}, AsyncMock())]).run("u")
+    assert result.stop_reason == "error" and not responder.requests
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_hard_context_rejects_nonpositive_model_length(limit):
+    client, _ = client_for([text_response("unused")])
+    with pytest.raises(ValueError, match="max_model_len"):
+        Agent(name="main", system_prompt="s", llm=client, max_steps=1, tools=[], max_model_len=limit)

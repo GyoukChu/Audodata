@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 import time
 from typing import Callable, Literal
@@ -55,6 +56,7 @@ class Agent:
         context_budget_chars: int | None = None,
         context_budget_tokens: int | None = None,
         keep_recent_tool_results: int = 6,
+        max_model_len: int | None = None,
     ):
         if max_steps < 0 or tool_result_max_chars < 0:
             raise ValueError("max_steps and tool_result_max_chars must be nonnegative")
@@ -64,6 +66,8 @@ class Agent:
             raise ValueError("context_budget_tokens must be nonnegative")
         if keep_recent_tool_results < 0:
             raise ValueError("keep_recent_tool_results must be nonnegative")
+        if max_model_len is not None and max_model_len <= 0:
+            raise ValueError("max_model_len must be positive")
         self.name = name
         self.system_prompt = system_prompt
         self.tools = tools
@@ -75,6 +79,7 @@ class Agent:
         self.context_budget_chars = context_budget_chars
         self.context_budget_tokens = context_budget_tokens
         self.keep_recent_tool_results = keep_recent_tool_results
+        self.max_model_len = max_model_len
 
     def _record(self, record: dict) -> None:
         if self.transcript_path is not None:
@@ -97,6 +102,8 @@ class Agent:
         steps_used = 0
         final_text = ""
         tool_map = {tool.name: tool for tool in self.tools}
+        tool_specs = [tool.to_openai() for tool in self.tools]
+        tool_schema_chars = len(json.dumps(tool_specs, ensure_ascii=False)) if tool_specs else 0
         elided: set[int] = set()
         last_prompt_tokens: int | None = None
         last_prompt_chars = 0
@@ -178,16 +185,91 @@ class Agent:
                     **context_data(),
                 })
 
+        def hard_preflight(step: int, *, max_tokens: int | None = None) -> int | None:
+            if self.max_model_len is None:
+                return None
+            if max_tokens is None:
+                max_tokens = self.llm.endpoint.max_tokens
+
+            def estimate() -> float:
+                total = sum(_message_chars(message) for message in messages)
+                if last_prompt_tokens is not None:
+                    return max(0.0, last_prompt_tokens + (total - last_prompt_chars) / 4)
+                return (total + tool_schema_chars) / 4
+
+            def fits() -> bool:
+                return estimate() + max_tokens <= self.max_model_len
+
+            def log(action: str, **data) -> None:
+                self._event(step, "elide", {
+                    "action": action, "context_tokens": estimate(),
+                    "max_tokens": max_tokens, "max_model_len": self.max_model_len, **data,
+                })
+
+            def compact(indexes: list[int], *, reasoning: bool = False) -> None:
+                for index in indexes:
+                    if fits():
+                        break
+                    message = messages[index]
+                    before = _message_chars(message)
+                    if reasoning:
+                        fields = [key for key in ("reasoning", "reasoning_content") if key in message]
+                        if not fields:
+                            continue
+                        for key in fields:
+                            del message[key]
+                        log("drop_reasoning", message_index=index, fields=fields,
+                            original_chars=before - _message_chars(message))
+                    elif index not in elided:
+                        replacement = "[tool result elided; full text in transcript]"
+                        # Compaction must never make a short result larger.
+                        if len(replacement) >= len(message["content"]):
+                            continue
+                        message["content"] = replacement
+                        elided.add(index)
+                        log("elide_tool_result", message_index=index, original_chars=before,
+                            tool_call_id=message["tool_call_id"], content=replacement)
+
+            tools = [i for i, message in enumerate(messages) if message["role"] == "tool"]
+            turns = [i for i, message in enumerate(messages) if message["role"] == "assistant"]
+            keep = self.keep_recent_tool_results
+            compact(tools[:max(0, len(tools) - keep)])
+            compact(turns[:max(0, len(turns) - keep)], reasoning=True)
+            protected = tools[max(0, len(tools) - keep):] + turns[max(0, len(turns) - keep):]
+            window = max(2, len(messages) - min(protected, default=len(messages)))
+            while not fits() and window > 2:
+                window -= 1
+                log("shrink_protected_window", protected_messages=window)
+                cutoff = len(messages) - window
+                compact([i for i in tools if i < cutoff])
+                compact([i for i in turns if i < cutoff], reasoning=True)
+            if not fits():
+                available = math.floor(self.max_model_len - estimate())
+                if available >= 8192:
+                    previous_max_tokens, max_tokens = max_tokens, min(max_tokens, available)
+                    log("lower_max_tokens", previous_max_tokens=previous_max_tokens)
+                else:
+                    log("context_limit_exceeded", available_completion_tokens=available)
+                    raise ValueError(
+                        f"context preflight: estimated prompt {estimate():.0f} tokens plus "
+                        f"completion allowance cannot fit max_model_len={self.max_model_len} "
+                        "(minimum reduced max_tokens is 8192)"
+                    )
+            return max_tokens
+
         try:
             append({"role": "system", "content": self.system_prompt}, 0)
             append({"role": "user", "content": task_prompt}, 0)
             for step in range(1, self.max_steps + 1):
                 steps_used = step
+                call_max_tokens = hard_preflight(step)
                 fit_context(step)
+                call_max_tokens = hard_preflight(step, max_tokens=call_max_tokens)
                 usage["calls"] += 1
                 sent_chars = sum(_message_chars(message) for message in messages)
                 completion = await self.llm.chat(
-                    messages, tools=[tool.to_openai() for tool in self.tools],
+                    messages, tools=tool_specs,
+                    **({"max_tokens": call_max_tokens} if call_max_tokens is not None else {}),
                 )
                 last_prompt_tokens = completion.usage.get("prompt_tokens")
                 last_prompt_chars = sent_chars

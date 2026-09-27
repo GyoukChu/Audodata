@@ -11,7 +11,7 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 def _load_summaries(root: Path, filename: str) -> list[dict[str, Any]]:
@@ -64,6 +64,33 @@ def _skipped_locked(root: Path, runs: list[dict[str, Any]]) -> int:
     return len(ids)
 
 
+def _cohort_counts(
+    root: Path, filename: str, runs: list[dict], *,
+    is_completed: Callable[[dict], bool], is_accepted: Callable[[dict], bool],
+) -> tuple[list[dict], dict]:
+    manifest = root / "cohort.json"
+    if manifest.exists():
+        requested = set(json.loads(manifest.read_text(encoding="utf-8"))["paper_ids"])
+        runs = [run for run in runs if run["paper_id"] in requested]
+        n_requested = len(requested)
+        n_pending = len(requested - {run["paper_id"] for run in runs})
+    else:
+        # Without a manifest only workspaces already created reveal pending work.
+        n_pending = sum(1 for path in root.glob("*") if path.is_dir()
+                        and not path.name.startswith(("_", ".")) and ".old." not in path.name
+                        and not (path / filename).exists())
+        n_requested = len(runs) + n_pending
+    completed = [run for run in runs if is_completed(run)]
+    return runs, {
+        "n_requested": n_requested, "n_completed": len(completed),
+        "n_incomplete": len(runs) - len(completed), "n_pending": n_pending,
+        "acceptance_rate_completed": round(sum(is_accepted(run) for run in completed) / len(completed), 4)
+        if completed else None,
+        "acceptance_rate_cohort": round(sum(is_accepted(run) for run in runs) / n_requested, 4)
+        if n_requested else None,
+    }
+
+
 def _mean(xs: Iterable[float | None]) -> float | None:
     vals = [float(x) for x in xs if x is not None]
     return round(st.fmean(vals), 4) if vals else None
@@ -90,11 +117,16 @@ def _table1(items: list[dict], rounds: list[dict]) -> dict[str, Any]:
 
 def summarize_agentic(root: str | Path) -> dict[str, Any]:
     runs = _load_summaries(Path(root), "harness_summary.json")
+    runs, cohort = _cohort_counts(Path(root), "harness_summary.json", runs,
+                                  is_completed=lambda r: bool(r.get("completed", True)),
+                                  is_accepted=lambda r: bool(r.get("accepted")))
     accepted = [r for r in runs if r.get("accepted")]
     final = [r for r in runs if r.get("final_accepted")]
 
     def _acc_round(r: dict) -> dict:
-        return r["rounds"][r["accepted_round"] - 1]
+        index = r.get("accepted_round")
+        rounds = r.get("rounds") or []
+        return rounds[index - 1] if isinstance(index, int) and 0 < index <= len(rounds) else {}
 
     acc_rounds = [_acc_round(r) for r in accepted]
     final_rounds = [_acc_round(r) for r in final]
@@ -117,8 +149,8 @@ def summarize_agentic(root: str | Path) -> dict[str, Any]:
         "table1": _table1(accepted, acc_rounds),
         "table1_after_final_qv": _table1(final, final_rounds),
         "guardrail_events": sum(len(r.get("guardrail_events") or []) for r in runs),
-        "incomplete_runs": sum(1 for r in runs if not r.get("completed", True)),
-        "n_incomplete": sum(1 for r in runs if not r.get("completed", True)),
+        "incomplete_runs": cohort["n_incomplete"],
+        **cohort,
         "n_skipped_locked": _skipped_locked(Path(root), runs),
         "rounds_per_paper_mean": _mean(r.get("n_rounds") for r in runs),
         "failed_round_modes": {k: {"count": v, "share": round(v / n_failed, 3)} for k, v in modes.most_common()},
@@ -133,6 +165,12 @@ def summarize_agentic(root: str | Path) -> dict[str, Any]:
 
 def summarize_cot(root: str | Path) -> dict[str, Any]:
     runs = _load_summaries(Path(root), "cot_summary.json")
+    runs, cohort = _cohort_counts(
+        Path(root), "cot_summary.json", runs,
+        is_completed=lambda r: bool(r.get("completed", r.get("weak_avg") is not None
+                                         and r.get("strong_avg") is not None and not r.get("errors"))),
+        is_accepted=lambda r: bool(r.get("would_be_accepted")),
+    )
     ok = [r for r in runs if r.get("weak_avg") is not None and r.get("strong_avg") is not None and not r.get("errors")]
     qv_ok = [r for r in ok if r.get("qv_passed")]
     final_ok = [r for r in ok if r.get("final_filter_passed")]
@@ -153,6 +191,7 @@ def summarize_cot(root: str | Path) -> dict[str, Any]:
         "kind": "cot",
         "root": str(root),
         "n_papers": len(runs),
+        **cohort,
         "n_evaluated": len(ok),
         "n_challenger_parse_failures": sum(1 for r in runs if r.get("challenger_parsed") is False),
         "qv_pass_rate": round(len(qv_ok) / len(ok), 3) if ok else None,
@@ -168,7 +207,7 @@ def print_report(s: dict[str, Any]) -> None:
     if s.get("kind") == "agentic":
         t = s["table1"]
         print(f"\n== Agentic Self-Instruct: {s['root']} ==")
-        print(f"papers {s['n_papers']}  accepted {s['n_accepted']} ({s['acceptance_rate']})  after final QV {s['n_final_accepted']}")
+        print(f"papers {s['n_papers']}  accepted {s['n_accepted']}  after final QV {s['n_final_accepted']}")
         print("| Metric | Agentic (accepted) |\n|---|---|")
         print(f"| Weak solver avg | {t['weak_solver_avg']} |\n| Strong solver avg | {t['strong_solver_avg']} |\n| Gap (strong-weak) | {t['gap']} |")
         print(f"| Agentic rounds (mean/median/max) | {t['agentic_rounds_mean']} / {t['agentic_rounds_median']} / {t['agentic_rounds_max']} |")
@@ -185,6 +224,9 @@ def print_report(s: dict[str, Any]) -> None:
             t = s[name]
             print(f"[{name}] n={t['n']} weak {t['weak_solver_avg']} strong {t['strong_solver_avg']} gap {t['gap']} "
                   f"qlen {t['question_length_chars']} rubric {t['rubric_items']} pass-solver-criteria {t['would_pass_solver_criteria']}")
+    print(f"requested {s['n_requested']}  completed {s['n_completed']}  incomplete {s['n_incomplete']}  pending {s['n_pending']}")
+    print(f"acceptance rate (completed): {s['acceptance_rate_completed']}  "
+          f"acceptance rate (cohort): {s['acceptance_rate_cohort']}")
 
 
 def main(argv: list[str] | None = None) -> int:

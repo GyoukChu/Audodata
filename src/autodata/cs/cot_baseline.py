@@ -26,7 +26,10 @@ from autodata.llm.client import LLMClient
 
 async def _eval(cfg: AppConfig, workdir: Path, mode: str) -> tuple[str, dict | None, int | None]:
     """Run the evaluator CLI as an isolated subprocess with a deadline and cancellation-safe cleanup."""
-    argv = ["--input", str((workdir / "eval_input.json").resolve()), f"--{mode}", "--output-dir",
+    # The baseline evaluates BOTH solvers on every item (Table 1 needs both columns): the strong stage must not be
+    # gated on a passing weak result, so the strong-only call uses --force-strong (unavailable to the agent sandbox).
+    argv = ["--input", str((workdir / "eval_input.json").resolve()), f"--{mode}",
+            *(["--force-strong"] if mode == "strong-only" else []), "--output-dir",
             str((workdir / "eval_attempts").resolve()), "--config", str((workdir / ".opencode/tools/api_config.json").resolve()),
             "--timeout", str(cfg.eval.timeout_s)]
     deadline = evaluator_deadline_s(cfg, mode, cfg.eval.timeout_s)

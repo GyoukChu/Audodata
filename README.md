@@ -45,13 +45,23 @@ cp .env.example .env                              # HF_TOKEN, S2_API_KEY
 echo 'export AUTODATA_CACHE_DIR=/path/to/cache' > env.local.sh   # optional, default ./.cache
 source env.sh
 python -m pytest -q                               # offline tests
-bash serving/serve_glm53.sh; bash serving/serve_qwen27b.sh; bash serving/serve_qwen4b.sh   # see serving/NOTES.md
+bash serving/serve_glm53.sh                         # see serving/NOTES.md
+until curl -fsS --max-time 3 http://127.0.0.1:8000/v1/models >/dev/null; do sleep 15; done
+bash serving/serve_qwen27b.sh
+until curl -fsS --max-time 3 http://127.0.0.1:8001/v1/models >/dev/null; do sleep 15; done
+bash serving/serve_qwen4b.sh
+bash scripts/wait_servers.sh                       # all three must be ready
 autodata-build-corpus --out data/corpus/cs2022_smoke.jsonl --n-papers 24 --shard-indices 0
+bash scripts/wait_servers.sh                       # recheck before the pipeline
 autodata-run-cs --config configs/cs_pilot.yaml --corpus data/corpus/cs2022_smoke.jsonl --workdir-root runs/smoke24
+bash scripts/wait_servers.sh
 autodata-cot-baseline --config configs/cs_pilot.yaml --corpus data/corpus/cs2022_smoke.jsonl --workdir-root runs/smoke24_cot
 autodata-stats --run-root runs/smoke24 --cot-root runs/smoke24_cot
 ```
 See `docs/RUNBOOK.md` for the full sequence and `docs/REPORT.md` for results and deviations.
+Each run root contains `cohort.json` with the requested paper IDs and config/prompt provenance. Resuming with changed
+config or prompts stops unless `autodata-run-cs --allow-config-mismatch` is supplied; overrides are recorded in manifest
+history. Statistics report acceptance over completed papers and over the full requested cohort, including pending papers.
 
 ## Fidelity notes
 * Acceptance thresholds default to the Sec. 3.1 prose (strong ≥ 0.65, weak < 0.50, gap ≥ 20 pp); the appendix/README

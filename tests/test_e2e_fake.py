@@ -301,3 +301,43 @@ def test_subagents_cannot_read_outside_the_paper_view(tmp_path: Path):
         assert SENTINEL_REF not in out, (cmd, out[:200])
         assert "Error" in out or out.strip() == "" or "not permitted" in out or "outside" in out.lower() or "No such" in out, (cmd, out[:200])
     assert summary["accepted"] is True  # the round itself still completes normally
+
+
+def test_state_machine_blocks_qv_shopping_reevaluation_and_weight_tampering(tmp_path: Path):
+    """Within a round: a second QV on the same question is refused, a completed evaluation is served from cache (no new
+    evaluator run), a question that is not the challenger's is refused, rubric weights changed after QV break the binding,
+    and nothing can be evaluated after acceptance."""
+    tampered = json.loads(json.dumps(EVAL_INPUT))
+    tampered["rubric"][0]["weight"] = 10  # was 5: same criterion text, different weight -> QV binding must fail
+    foreign = json.loads(json.dumps(EVAL_INPUT))
+    foreign["question"] = "A question the challenger never wrote?"
+    steps = [
+        tool_call_response([("task", {"description": "challenger round 1", "prompt": "Generate ... ./paper.txt", "subagent_type": "challenger"})]),
+        tool_call_response([("task", {"description": "QV round 1", "prompt": QV_PROMPT_FULL, "subagent_type": "quality_verifier"})]),
+        tool_call_response([("task", {"description": "QV again", "prompt": QV_PROMPT_FULL, "subagent_type": "quality_verifier"})]),   # refused
+        tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(tampered)})]),
+        tool_call_response([("bash", {"command": WEAK_CMD})]),      # runs, but the candidate is not QV-bound (weight changed)
+        tool_call_response([("bash", {"command": STRONG_CMD})]),    # runs; acceptance refused (qv_not_bound)
+        tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(foreign)})]),
+        tool_call_response([("bash", {"command": WEAK_CMD})]),      # refused: foreign question
+        tool_call_response([("write", {"filePath": "eval_input.json", "content": json.dumps(EVAL_INPUT)})]),
+        tool_call_response([("bash", {"command": WEAK_CMD})]),      # real evaluation of the QV-bound candidate
+        tool_call_response([("bash", {"command": WEAK_CMD})]),      # cached (no new run dir)
+        tool_call_response([("bash", {"command": STRONG_CMD})]),    # accepted
+        tool_call_response([("bash", {"command": STRONG_CMD})]),    # refused: after acceptance
+        tool_call_response([("write", {"filePath": "output/result.json", "content": json.dumps(RESULT_JSON)})]),
+        text_response("done"),
+    ]
+    scenario = Scenario(main_steps=steps)
+    summary, wd = _run(tmp_path, scenario, paper_id="p3")
+    kinds = [e["kind"] for e in summary["guardrail_events"]]
+    assert "qv_repeat" in kinds and "qv_not_bound" in kinds and "eval_foreign_candidate" in kinds
+    assert "eval_repeat" in kinds and "eval_after_accept" in kinds, kinds
+    assert summary["accepted"] is True and summary["accepted_round"] == 1
+    runs = sorted((wd / "eval_attempts").glob("run_*"))
+    # tampered weak + tampered strong + real weak + real strong = 4 evaluator runs; cached/refused calls create none
+    assert len(runs) == 4, [r.name for r in runs]
+    r1 = summary["rounds"][0]
+    assert r1["failure_mode"] == "ACCEPTED" and r1["rubric"][0]["weight"] == 5 and abs(r1["weak_avg"] - 0.15) < 1e-9
+    # only one QV subagent transcript exists for the round (the repeat was refused before spawning)
+    assert len(list((wd / "trajectory").glob("quality_verifier_*.jsonl"))) == 1

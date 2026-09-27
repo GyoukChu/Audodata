@@ -117,6 +117,15 @@ def _write_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def attempt_seed(base_seed: int | None, data: dict[str, Any], role: str, index: int) -> int | None:
+    """Distinct, reproducible seed per (question, solver role, attempt index); None when sampling is unseeded.
+    Identical seeds across the 3 attempts would collapse them into one sample (found in review)."""
+    if base_seed is None:
+        return None
+    digest = hashlib.sha1(f"{base_seed}|{compute_question_hash(data)}|{role}|{index}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
 def _run_attempt(
     index: int, role: str, solver: SyncClient, judge: SyncClient,
     data: dict[str, Any], rubric: list[RubricItem], config: _ApiConfig,
@@ -125,7 +134,8 @@ def _run_attempt(
     started = time.perf_counter()
     started_at = _utc_now()
     attempt = run_solver(solver, data["context"], data["question"], prompts / "solver_user.md",
-                         retries=config.eval.solver_retries, timeout=timeout)
+                         retries=config.eval.solver_retries, timeout=timeout,
+                         seed=attempt_seed(solver.request_seed, data, role, index))
     record = asdict(attempt)
     record.update(index=index, solver=role, model=solver.endpoint.model, started_at=started_at,
                   score=None, satisfied=None, evidence=None, breakdown=None, judge=None,
@@ -390,7 +400,21 @@ def _render_report(report: dict[str, Any], preset: AcceptancePreset, rubric: lis
     return "\n".join(lines) + "\n"
 
 
+def _die_with_parent() -> None:
+    """Linux: deliver SIGTERM to this process when the parent (the harness) dies (review finding #8)."""
+    try:
+        import ctypes
+        import signal
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG = 1
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None = None) -> int:
+    if transport is None:
+        _die_with_parent()
     parser = _Parser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -399,6 +423,9 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--weak-only", action="store_true")
     modes.add_argument("--strong-only", action="store_true")
+    parser.add_argument("--force-strong", action="store_true",
+                        help="strong-only: evaluate the strong solver even without a passing weak result (CoT baseline "
+                             "statistics need both solvers on every item; the agent sandbox does not allow this flag)")
     try:
         args = parser.parse_args(argv)
         input_path, config_path = args.input.resolve(), args.config.resolve()
@@ -430,7 +457,7 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
             "parsed_rubric": [asdict(item) for item in rubric],
             "models": {role: getattr(config, role).model for role in ("weak_solver", "strong_solver", "judge")},
             "eval": config.eval.model_dump(), "acceptance": config.acceptance.model_dump(),
-            "timeout_s": timeout, "prompts_dir": str(prompts), "run_dir": str(run_dir),
+            "timeout_s": timeout, "prompts_dir": str(prompts), "run_dir": str(run_dir), "force_strong": bool(args.force_strong),
             "started_at": _utc_now(), "weak_attempts": [], "strong_attempts": [],
             "weak_source_report": None, "weak_source_run_dir": None, "error": None,
         }
@@ -448,7 +475,7 @@ def main(argv: list[str] | None = None, *, transport: httpx.BaseTransport | None
             report.update(assess_attempts(rubric, report["weak_attempts"], report["strong_attempts"], config.acceptance))
             if role == "strong" and not report["weak_passed"]:
                 break
-            if mode == "strong-only" and (not previous or previous.get("weak_passed") is not True):
+            if mode == "strong-only" and not args.force_strong and (not previous or previous.get("weak_passed") is not True):
                 break
             attempts = _run_stage(role, data, rubric, config, prompts, timeout, run_dir, transport)
             report[f"{role}_attempts"] = attempts
